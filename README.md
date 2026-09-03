@@ -123,7 +123,7 @@ version moved, delete the stale tarball, and `npm install`.
 
 ## Running the harness
 
-Two harnesses, both driving real Chromium through Playwright. A real browser
+Three harnesses, both driving real Chromium through Playwright. A real browser
 rather than a headless Node client because `frame()` is driven by
 `requestAnimationFrame`, and rAF is what a browser throttles, what a hidden tab
 stops entirely, and what a busy tab delays. The frame loop **is** the
