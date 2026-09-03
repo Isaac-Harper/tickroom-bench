@@ -139,6 +139,18 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
   let dir = 0;
   let seq = 0;
   let predictedY = FIELD_H / 2;
+  /**
+   * The prediction one stamped tick BEHIND `predictedY`. The prediction only
+   * advances when a tick is stamped, once per 50ms at 20Hz, while this page
+   * draws at 60fps: drawn raw, our paddle holds still for two frames in three
+   * and then jumps a whole tick of travel, which reads as stutter even with the
+   * reconciliation perfect. So the draw interpolates between this and
+   * `predictedY` by `conn.tick.fraction`, the standard fixed-timestep render
+   * interpolation, at the price of one tick of visual delay on the one entity
+   * we steer. 50ms on top of a zero-latency prediction is invisible; a 4.5
+   * unit step three times a second is not.
+   */
+  let prevPredictedY = FIELD_H / 2;
   /** High-water mark of the ticks we have stamped. -1 means the counter has never been anchored. */
   let lastSentTick = -1;
   /** The redundancy window: the last `INPUT_WINDOW` records, oldest first. Re-sent whole on every packet, and replayed on every snapshot. */
@@ -351,6 +363,10 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       });
       const seat = selfSide === null || Math.abs(error) > MAX_GLIDE;
       selfSide = mine.side;
+      // The correction goes to the ErrorOffset alone. Shifting the previous
+      // tick's state by the same delta keeps the interpolation from gliding
+      // it a second time.
+      prevPredictedY += replayed - predictedY;
       predictedY = replayed;
 
       if (seat) {
@@ -517,6 +533,9 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       if (sent.length > INPUT_WINDOW) sent.shift();
       // PREDICT: the same function the simulation runs, on the same input, on
       // the tick this record names.
+      // One tick behind, however many ticks this call stamps: the frame
+      // interpolates across the LAST step only.
+      prevPredictedY = predictedY;
       predictedY = stepPaddleY(predictedY, rec.data.dir, DT);
     }
     lastSentTick = conn.tick.value;
@@ -549,7 +568,8 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
     // SAMPLED ONCE PER FRAME. `sample` advances the decay, so the draw below
     // reuses this value rather than sampling again.
     const errZ = err.sample(dt).z;
-    const ownRendered = selfSide !== null ? predictedY + errZ : null;
+    const ownRendered =
+      selfSide !== null ? prevPredictedY + (predictedY - prevPredictedY) * conn.tick.fraction + errZ : null;
     const entities: [string, number, number][] = [];
     for (const [id, e] of view) entities.push([id, e.x, e.y]);
     frameBuf.push({
