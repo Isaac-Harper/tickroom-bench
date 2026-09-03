@@ -3,10 +3,11 @@
 // This is `examples/pong/client.ts` from the library, wired exactly as the
 // README's step 3 shows: tickHz matching the simulation, `decodeSnapshot`
 // lifting this pid's own `inputLead` out of the per-paddle field, an
-// interpolator driven by the connection itself, `onStallChange`,
-// `onTickReanchor`, and `onTerminal` with the documented bounded re-assign.
-// Read the library's copy for why each of those is shaped the way it is; the
-// reasoning is unchanged and is not repeated here.
+// interpolator driven by the connection itself, the paddle owned by a
+// `PredictedEntity` running the simulation's own `stepPaddleY`,
+// `onStallChange`, `onTickReanchor` as telemetry, and `onTerminal` with the
+// documented bounded re-assign. Read the library's copy for why each of those
+// is shaped the way it is; the reasoning is unchanged and is not repeated here.
 //
 // THREE THINGS ARE ADDED, all of them because this page is measured by a robot
 // rather than played by a person:
@@ -30,7 +31,7 @@
 //    measure the balancer instead.
 
 import {
-  ErrorOffset,
+  PredictedEntity,
   RoomConnection,
   SnapshotInterpolator,
   isRosterFrame,
@@ -58,22 +59,11 @@ interface PongSnapshot {
   inputLead?: number | undefined;
 }
 
-/** One stamped input. `targetTick` is the whole point: the server applies this record on that tick and not on the tick it happened to arrive. `seq` is carried for this file's own use and never read by the library. */
-interface PongInput {
-  seq: number;
-  targetTick: number;
-  data: { dir: number };
-}
-
-/** Ticks of input re-sent on every packet, matching `INPUT_WINDOW_MAX` in the library's snapshot codec. Six is 300ms of redundancy at 20Hz, and a playout push is duplicate-overwriting and out-of-order safe, so a re-sent record costs nothing but its bytes. */
-const INPUT_WINDOW = 6;
-
-/** Must equal `pongRuntime.tickHz` and `TICK_HZ` in lib/rooms.ts. Stated once and used three times below (the connection's basis, the prediction's timestep, the send cadence). */
+/** Must equal `pongRuntime.tickHz` and `TICK_HZ` in lib/rooms.ts. Stated once and used twice below (the connection's basis and the prediction's timestep). */
 const TICK_HZ = 20;
-const DT = 1 / TICK_HZ;
 
-/** The largest disagreement worth HIDING, in field units. Past a quarter of the field the two ends are desynced rather than a tick of skew apart, and a glide would clamp and jump by the remainder anyway. */
-const MAX_GLIDE = FIELD_H / 4;
+/** Where a paddle sits for each side. The server owns the assignment; this is only where to draw it. */
+const paddleX = (side: 'left' | 'right'): number => (side === 'left' ? 6 : FIELD_W - 6);
 
 /** How many capacity bounces a client will follow before giving up. Bounded because the balancer and the ticker disagree for up to a stats TTL, so an unbounded loop is a client that never lands. */
 const MAX_REASSIGNS = 3;
@@ -137,40 +127,6 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
 
   /** Held input, -1 up through +1 down. A STATE the player holds, not an event that fires once, which is what makes a dropped packet harmless. */
   let dir = 0;
-  let seq = 0;
-  let predictedY = FIELD_H / 2;
-  /**
-   * The prediction one stamped tick BEHIND `predictedY`. The prediction only
-   * advances when a tick is stamped, once per 50ms at 20Hz, while this page
-   * draws at 60fps: drawn raw, our paddle holds still for two frames in three
-   * and then jumps a whole tick of travel, which reads as stutter even with the
-   * reconciliation perfect. So the draw interpolates between this and
-   * `predictedY` by `conn.tick.fraction`, the standard fixed-timestep render
-   * interpolation, at the price of one tick of visual delay on the one entity
-   * we steer. 50ms on top of a zero-latency prediction is invisible; a 4.5
-   * unit step three times a second is not.
-   */
-  let prevPredictedY = FIELD_H / 2;
-  /** High-water mark of the ticks we have stamped. -1 means the counter has never been anchored. */
-  let lastSentTick = -1;
-  /** The redundancy window: the last `INPUT_WINDOW` records, oldest first. Re-sent whole on every packet, and replayed on every snapshot. */
-  const sent: PongInput[] = [];
-
-  // A correction is a GLIDE, never a teleport: adopt the server's answer in
-  // full and push the equal-and-opposite delta in here, so the rendered paddle
-  // is exactly where it was the frame before and the offset bleeds to zero over
-  // the next few frames.
-  const err = new ErrorOffset({
-    posTau: 0.1,
-    headingTau: 0.1,
-    posCap: MAX_GLIDE,
-    headingCap: 0,
-    // PER FRAME, not per second. At 60fps this is exactly the paddle's own top
-    // speed, so a correction can never slide the paddle faster than a player
-    // could have moved it.
-    posMaxStep: PADDLE_SPEED / 60,
-    headingMaxStep: 0,
-  });
 
   /**
    * The room this client is currently trying to join. It starts as the one the
@@ -307,7 +263,7 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
         // path no player uses.
         entities.set('marker', { x: snap.markerX, y: 0 });
         for (const p of snap.paddles) {
-          entities.set(p.pid, { x: p.side === 'left' ? 6 : FIELD_W - 6, y: p.y });
+          entities.set(p.pid, { x: paddleX(p.side), y: p.y });
         }
         return entities;
       },
@@ -331,56 +287,29 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       scores = next;
 
       // RECONCILE THE PREDICTION. The snapshot is authoritative for tick
-      // `snap.tick`, but we have already stamped and simulated inputs for ticks
-      // after that, so the server's y is where our paddle was several ticks
-      // ago. Replay our own stored records from there and the two are on the
-      // same tick again. This is the whole reason the window is kept rather
-      // than only sent.
+      // `snap.tick`, but the entity has already stamped and simulated inputs
+      // for ticks after that, so the server's y is where our paddle was
+      // several ticks ago. The entity replays its own stored records from
+      // there, adopts the result, and glides the difference away; the first
+      // confirmation snaps, which is also what seats the paddle's x.
       const mine = snap.paddles.find((p) => p.pid === selfPid);
       if (!mine) return;
-      let replayed = mine.y;
-      let covered = 0;
-      for (const rec of sent) {
-        if (rec.targetTick > snap.tick) {
-          replayed = stepPaddleY(replayed, rec.data.dir, DT);
-          covered += 1;
-        }
-      }
-
-      const error = predictedY - replayed;
-      // DIAGNOSTIC. How many ticks past the snapshot the prediction has run,
-      // how many of them the window could replay, and the error that left.
-      // `missing` above zero means the window is shorter than the lead, which
-      // shows on screen as a paddle that runs behind while moving and wobbles
-      // when it stops.
+      selfSide = mine.side;
+      paddle.reconcile({ x: paddleX(mine.side), y: mine.y }, snap.tick);
+      // DIAGNOSTIC. The tick the snapshot named, the tick the entity had
+      // stamped to, and the error the replay left, as a magnitude: nonzero
+      // anywhere but the first confirmation means the two ends disagreed
+      // about the input timeline, which `bench/paddle.mjs` provokes on
+      // purpose by changing the input mid-run. The old `covered` and
+      // `missing` fields are gone with the hand-written window: the entity
+      // keeps a replay history deeper than its re-send window, so a lead
+      // past six ticks no longer comes up short.
       record('reconcile', {
         snapTick: snap.tick,
         tick: conn.tick.value,
-        covered,
-        missing: Math.max(0, lastSentTick - snap.tick - covered),
-        error: +error.toFixed(3),
+        error: +paddle.stats.lastError.toFixed(3),
         serverY: +mine.y.toFixed(3),
       });
-      const seat = selfSide === null || Math.abs(error) > MAX_GLIDE;
-      selfSide = mine.side;
-      // The correction goes to the ErrorOffset alone. Shifting the previous
-      // tick's state by the same delta keeps the interpolation from gliding
-      // it a second time.
-      prevPredictedY += replayed - predictedY;
-      predictedY = replayed;
-
-      if (seat) {
-        // SNAP in the two cases a glide is the wrong answer: the first
-        // confirmation of all (where `predictedY` is a guess at the spawn
-        // position) and a disagreement larger than the offset can hold anyway.
-        err.reset();
-        return;
-      }
-      // `absorb` takes the OLD pose minus the NEW one: exactly what must be
-      // added to the corrected pose to leave the RENDERED pose unchanged this
-      // frame. On a healthy link it is the snapshot's own rounding and nothing
-      // else.
-      err.absorb({ x: 0, z: error, heading: 0 });
     },
 
     onText: (msg) => {
@@ -408,25 +337,15 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       if (el) el.style.display = stalled ? 'block' : 'none';
     },
 
-    // THE COUNTER JUST JUMPED, and two things in this file are now wrong.
+    // THE COUNTER JUST JUMPED. TELEMETRY ONLY, now: this handler used to move
+    // the send high-water mark by the delta and drop the in-flight window,
+    // because a NEGATIVE delta (a handoff, a backgrounded tab, a clock step)
+    // otherwise left the send loop silent until the counter climbed back past
+    // the old mark, measured on a real socket at 5.6 seconds of input silence
+    // and 100 self-inflicted starves. `PredictedEntity` reads the jump off the
+    // counter itself and does both, so all that is left here is the count,
+    // which for a HIDDEN TAB is the whole measurement.
     onTickReanchor: (delta) => {
-      // 1. THE SEND DEDUPE. `lastSentTick` is a high-water mark on the counter
-      //    that just moved, and the delta can be NEGATIVE (a handoff, a
-      //    backgrounded tab, a clock step), which puts `conn.tick.value` below
-      //    a mark set before the correction. Without this line the send loop
-      //    goes silent until the counter climbs back past the old mark:
-      //    measured on a real socket at 5.6 seconds of total input silence and
-      //    100 self-inflicted starves at the server, on an otherwise perfectly
-      //    healthy connection. The library cannot see this file's dedupe, so
-      //    this line is the host's to write. It is also the single most likely
-      //    thing for a HIDDEN TAB to trigger, which is what makes it load
-      //    bearing for this app in particular.
-      lastSentTick += delta;
-      // 2. THE PREDICTION. The tick our paddle was predicted TO moved with the
-      //    counter, so the in-flight window describes a timeline that no longer
-      //    exists. Drop it and let the next snapshot re-seat the paddle through
-      //    the ordinary replay; the ErrorOffset makes that re-seat a glide.
-      sent.length = 0;
       record('reanchor', { delta });
     },
 
@@ -467,6 +386,27 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
     },
   });
 
+  // ---- our own paddle, the stamped path's client half ----------------------
+  //
+  // Once per frame `advance` stamps a record for every tick the counter
+  // crossed, predicts each through `step`, sends the last six as one JSON array
+  // (what the relay's `decodeInput` parses), and returns the pose to draw,
+  // interpolated across the last stamped tick by `conn.tick.fraction` with what
+  // is left of the last correction added. Once per snapshot `reconcile` replays
+  // and re-seats. The x never changes under `step`; the first reconcile seats
+  // it on the side the server chose.
+  const paddle = new PredictedEntity<{ dir: number }>({
+    conn,
+    tickHz: TICK_HZ,
+    // THE SAME FUNCTION THE SIMULATION RUNS, on the same input, on the tick the
+    // record names.
+    step: (pose, input, dt) => ({ x: pose.x, y: stepPaddleY(pose.y, input.dir, dt) }),
+    // Bounds the correction glide to the paddle's own top speed and sets the
+    // snap distance at half a second of travel.
+    maxSpeed: PADDLE_SPEED,
+    initial: { x: 0, y: FIELD_H / 2 },
+  });
+
   // ---- input --------------------------------------------------------------
 
   // The keys only ever move `dir`. Nothing is sent from here: a send is one
@@ -499,54 +439,6 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
     return Math.sin((s / BOT_PERIOD_S) * Math.PI * 2 + phase);
   };
 
-  // ---- the stamped send, driven by the tick and not by a timer ------------
-  //
-  // A fixed interval is subtly wrong for a stamped stream: a timer and the tick
-  // counter drift against each other, so some ticks get two records and some
-  // get none, and a tick with none is a tick the server has to guess at.
-  // Sending whenever the counter ADVANCED makes the record stream and the tick
-  // grid the same thing by construction.
-  const sendInputs = (): void => {
-    // The counter is meaningless until a snapshot has anchored it, and a record
-    // stamped from a meaningless counter is worse than an unstamped one: it
-    // names a tick the server may never reach and starves every tick it should
-    // have fed.
-    if (!conn.tick.initialized) return;
-    // THE FIRST SEND HAS NOTHING TO CATCH UP FROM. `conn.tick.value` is already
-    // thousands of ticks into this room's life, so a mark of -1 would ask the
-    // loop below to produce a record for every tick since the room booted.
-    if (lastSentTick < 0) lastSentTick = conn.tick.value - 1;
-    if (conn.tick.value <= lastSentTick) return;
-
-    // ONE RECORD PER TICK, not one per frame. The server consumes exactly the
-    // record stamped for a given tick, never "whatever arrived most recently",
-    // so a frame that crossed two ticks owes two records or the second tick
-    // starves. The `max` is the belt for whatever the tick-step cap and the
-    // re-anchor resync do not cover, and it is the window size because a record
-    // older than that cannot ride this packet anyway.
-    const from = Math.max(lastSentTick + 1, conn.tick.value - INPUT_WINDOW + 1);
-    for (let t = from; t <= conn.tick.value; t++) {
-      // `readDir` is the simulation's own clamp, run here so the record we
-      // predict with is byte for byte the record the server will apply.
-      const rec: PongInput = { seq: seq++, targetTick: t, data: { dir: readDir(dir) } };
-      sent.push(rec);
-      if (sent.length > INPUT_WINDOW) sent.shift();
-      // PREDICT: the same function the simulation runs, on the same input, on
-      // the tick this record names.
-      // One tick behind, however many ticks this call stamps: the frame
-      // interpolates across the LAST step only.
-      prevPredictedY = predictedY;
-      predictedY = stepPaddleY(predictedY, rec.data.dir, DT);
-    }
-    lastSentTick = conn.tick.value;
-
-    // THE WHOLE WINDOW ON EVERY PACKET, oldest first. A playout push is
-    // duplicate-overwriting and out-of-order safe, so a record the server
-    // already has costs nothing but its bytes, and a single lost or reordered
-    // packet stops being a starved tick.
-    conn.send(new TextEncoder().encode(JSON.stringify(sent)));
-  };
-
   // ---- the frame ----------------------------------------------------------
 
   let raf = 0;
@@ -557,19 +449,18 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
     const { entities: view, dt, stalled } = conn.frame(now);
     if (opts.bot) dir = botDir(now);
     // AFTER `frame()`, never before: the counter this stamps against is
-    // advanced by that call, so sending first stamps every record one frame
-    // into the past.
-    sendInputs();
+    // advanced by that call, so advancing first stamps every record one frame
+    // into the past. `readDir` is the simulation's own clamp, run here so the
+    // record predicted with is byte for byte the record the server applies.
+    // ONE CALL PER FRAME: it stamps, sends, and returns the pose to draw, so
+    // the draw below reuses `drawn` rather than advancing again.
+    const drawn = paddle.advance({ dir: readDir(dir) }, dt);
 
     // RECORDED BEFORE ANY DRAWING, so a slow canvas cannot show up as a late
     // frame in the measurement. Everything below this line is presentation.
     const marker = view.get('marker');
     const own = selfPid ? view.get(selfPid) : undefined;
-    // SAMPLED ONCE PER FRAME. `sample` advances the decay, so the draw below
-    // reuses this value rather than sampling again.
-    const errZ = err.sample(dt).z;
-    const ownRendered =
-      selfSide !== null ? prevPredictedY + (predictedY - prevPredictedY) * conn.tick.fraction + errZ : null;
+    const predicted = paddle.pose;
     const entities: [string, number, number][] = [];
     for (const [id, e] of view) entities.push([id, e.x, e.y]);
     frameBuf.push({
@@ -584,9 +475,9 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       x: marker ? marker.x : null,
       extrap: marker ? marker.extrapolated : null,
       ownX: own ? own.y : null,
-      ownY: ownRendered,
-      predictedY: selfSide !== null ? predictedY : null,
-      errZ: selfSide !== null ? +errZ.toFixed(3) : null,
+      ownY: selfSide !== null ? drawn.y : null,
+      predictedY: selfSide !== null ? predicted.y : null,
+      errZ: selfSide !== null ? +(drawn.y - predicted.y).toFixed(3) : null,
       entities,
       stalled,
     });
@@ -633,13 +524,12 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       }
     }
 
-    // OUR OWN PADDLE COMES FROM THE PREDICTION, plus whatever is left of the
-    // last correction. No interpolation delay and no round trip in it.
+    // OUR OWN PADDLE COMES FROM THE PREDICTION, drawn between its last two
+    // stamped ticks plus whatever is left of the last correction. No
+    // interpolation delay and no round trip in it.
     if (selfSide !== null) {
-      const ownX = selfSide === 'left' ? 6 : FIELD_W - 6;
-      const ownY = ownRendered ?? predictedY;
       ctx.fillStyle = '#fff';
-      ctx.fillRect(ownX * sx - 2, ownY * sy - 12 * sy, 4, 24 * sy);
+      ctx.fillRect(drawn.x * sx - 2, drawn.y * sy - 12 * sy, 4, 24 * sy);
     }
 
     ctx.fillStyle = '#aaa';

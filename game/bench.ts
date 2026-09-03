@@ -59,9 +59,9 @@ export interface BenchFrame {
   extrap: boolean | null;
   /** This client's OWN paddle as the interpolator rendered it. Its only mover is this client's own stamped inputs, so it is the per-sender half of fairness. */
   ownX: number | null;
-  /** This client's OWN paddle as it was DRAWN: the local prediction plus what is left of the last correction. The number a player's eye follows, where `ownX` is the server's delayed view of the same paddle. */
+  /** This client's OWN paddle as it was DRAWN: what `PredictedEntity.advance` returned, the prediction interpolated across its last stamped tick plus what is left of the last correction. The number a player's eye follows, where `ownX` is the server's delayed view of the same paddle. */
   ownY: number | null;
-  /** The prediction alone, and the correction offset alone, so a wobble can be attributed to one or the other. */
+  /** The raw prediction alone (`PredictedEntity.pose.y`, the pose after the last stamped tick), and the drawn y minus it: the between-tick interpolation plus the correction offset, so a wobble can be attributed to the prediction or to the draw. `errZ` used to be the offset alone, when the page held the offset itself; the entity does not expose the two parts separately, so the split is now prediction versus everything the draw adds. */
   predictedY: number | null;
   errZ: number | null;
   /** Every entity this frame drew, as `[id, x, y]`. How a client's view of the ROSTER is measured rather than just its view of the marker. */
@@ -82,6 +82,7 @@ export interface BenchEvent {
     | 'rate-mismatch'
     | 'mint-error'
     | 'roster'
+    /** One per snapshot naming this pid: `snapTick`, the entity's stamped `tick`, the replay `error` as a magnitude (`PredictedEntity.stats.lastError`) and `serverY`. The hand-written window's `covered` and `missing` fields are gone: the entity keeps a replay history deeper than its re-send window, so the shortfall they measured no longer occurs, and `bench/paddle.mjs`'s "window shortfalls" count reads zero by construction. */
     | 'reconcile'
     /** The underlying socket's own close, with its code and reason. Not something the library reports: it turns a close into a status change and a reconnect, and the code is gone by then. See `BenchSocket` in `game/pong.ts` for the seam that sees it. */
     | 'close';
