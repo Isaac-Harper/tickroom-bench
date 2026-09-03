@@ -538,6 +538,73 @@ at risk of its own well-behaved traffic being rate-dropped. Every run above
 was at this room's 20Hz, well under either default, so none of the numbers
 above are affected.
 
+A second and third review round followed the first, on the harder edges of
+the same redesign: what the playhead does when a re-anchor undoes ticks it
+had already predicted, and what a stalled render loop rather than a stalled
+network does to the connection underneath it.
+
+**A backward re-anchor past the one-tick slack made the prediction
+double-step, on ticks the server was still holding.** The rewind landed one
+tick short of the mark the server had actually reached, so on a -2 or -3 the
+entity treated ticks the server had not dropped as gone, reconciling them a
+second time when the real stamps arrived instead of trusting the records
+already in flight for them. The prediction now rewinds to the stored pose at
+the new mark rather than short of it, and the records beyond that mark are
+re-stamped as the counter climbs back rather than replayed against a stale
+count. The playhead pays the ticks the rewind cost the way a forward jump is
+paid, by speculating ahead of the newest stored pose on whatever input the
+current frame carries and slewing at nine tenths of real time until the
+target catches it up, bounded at four ticks deep. Measured in the library's
+own harness: after a -2 the playhead held at exactly 0.900x for 80 frames
+and then dropped to real time, after a -3 for 110 frames; before this fix,
+holding the playhead to the history's end instead of drawing the speculation
+produced a near-pause of 0.08x to 0.11x for 8 to 11 frames, on the one
+entity the player steers, on every tolerance correction.
+
+**A 100 to 300ms main-thread hitch, a garbage-collection pause or one heavy
+frame, made the connection re-anchor as though the network had drifted, and
+undo it about two seconds later.** The re-anchor decision compared the raw
+tick counter against the incoming snapshot, and the counter only advances
+inside `frame()`; a hitch that skipped frames left it sitting where the last
+frame had put it while a snapshot landing inside the hitch read it as 2 to 5
+ticks behind, so the tolerance path re-anchored forward to close the gap and
+then, once the resume frame stamped the stall's own ticks on top of that,
+re-anchored backward by the same amount two seconds later to undo it, with
+every consumer's prediction eating both as real corrections. The connection
+now projects the counter by the wall time elapsed since the last frame
+before comparing it against a snapshot, so a stall is not drift: a 250ms
+hitch and a 120ms hitch each produce zero re-anchors on the library's test
+tree, and a genuine three-tick drift still fires exactly as before.
+
+**A NaN or infinite frame delta used to poison the playhead for good,**
+because `Math.max(0, NaN)` is `NaN` and every comparison against it downstream
+reads false forever after. A non-finite `dt` is now no time at all: the
+playhead and the glide hold still for that one frame, the stamps are
+whatever the counter already shows, and the next finite frame picks back up
+clean instead of carrying the poison forward.
+
+**Two `PredictedEntity` instances on one connection were overwriting each
+other's inputs,** because the ticker keeps exactly one playout buffer per
+player: whichever entity's frame ran last on a given tick won the buffer and
+the other drove blind against a record it never wrote. Construction now
+throws, naming the rule, the moment a second entity is built on the same
+connection. A player who steers more than one thing on the page carries all
+of it in a single input record instead of splitting it across entities.
+
+**A reconnect used to keep the old room's prediction and glide the entity
+out of its stale pose into the new room's truth.** An epoch edge, `tick.anchored`
+going false and back to true, now drops the entity's records, poses, mark
+and playhead outright and unconfirms it, so the new room's first reconcile
+is a counted snap onto its own truth rather than a roughly 450ms glide from
+a room the entity is no longer in, or a replay of stale records against a
+tick count that has already restarted.
+
+The deployed check on the final build: `bench/paddle.mjs`, 8 moves, a lead of
+4 to 5 ticks over the snapshot, 0 reconciles above 0.25 units, 0 direction
+flips, 0% of held frames motionless, largest single-frame step 1.59 units,
+both grades PASS. The library's own suite: 1101 tests across 39 files, green
+on a quiet machine.
+
 ## Running locally
 
 ```bash
