@@ -1,0 +1,22 @@
+node_modules
+.next
+out
+next-env.d.ts
+*.tsbuildinfo
+
+.env
+.env.*
+!.env.example
+
+.DS_Store
+.vercel
+
+# Harness output. Every run writes a timestamped JSON here and they are
+# measurements of one deployment at one moment, not source.
+bench/out/*.json
+
+# vendor/ is NOT ignored on purpose: vendor/tickroom-0.2.0.tgz is the
+# dependency itself. The library repo is private, so a git or registry
+# dependency would not install on a build machine with no credentials, and a
+# committed tarball is the only form that resolves with no auth at all. A
+# `vercel` file upload deploy carries it the same way.

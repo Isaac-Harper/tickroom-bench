@@ -1,0 +1,62 @@
+/* One stylesheet, and deliberately almost nothing in it. Every pixel this page
+   draws that is not the canvas is a pixel the harness has to wait for on load,
+   and a measurement rig whose page is slow to become interactive measures its
+   own chrome. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #0b0b0c;
+  color: #ddd;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+main {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #111;
+  border: 1px solid #262629;
+}
+
+h1 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+
+p {
+  margin: 8px 0;
+  color: #8a8a90;
+}
+
+code {
+  color: #b8b8c0;
+}
+
+.banner {
+  display: none;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px solid #3a3a40;
+  border-radius: 3px;
+}
+
+#stall {
+  color: #d8a13a;
+}
+
+#terminal {
+  color: #d8554a;
+}
