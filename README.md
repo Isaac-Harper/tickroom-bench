@@ -221,6 +221,26 @@ those rather than the fresh `about:blank` the mode is written against, and the
 client never mints. Measured: a fresh profile seated in fifteen seconds, and the
 next two runs on the kept profile timed out waiting for a player id.
 
+**A third script, `bench/paddle.mjs`, measures something neither of the other
+two can see.**
+
+```bash
+node bench/paddle.mjs --url https://tickroom-bench.vercel.app [--room pong~6] [--moves 8] [--hold 350]
+```
+
+It holds a direction key down, releases it, waits, and repeats that several
+times, counting every reconcile whose error is not zero and every direction
+flip in the DRAWN paddle after a release. A healthy deployment prints zero for
+both, and the script exits 1 on any nonzero reconcile or any post-release
+flip. It exists because `run.mjs` and `hidden-tab.mjs` both measure the
+marker, and the marker is server-driven: constant velocity, untouched by any
+key, so it can never show a disagreement in the input timeline. Steady motion
+hides a one-tick error completely; only a change in the input reveals it, as a
+correction landing at exactly the moment the input changes. A player's own
+paddle is the entity actually driven by a key, predicted locally and
+reconciled against every snapshot, so this script measures that entity
+directly instead of standing in for it with the marker.
+
 ## Results
 
 Measured on **2026-09-03 (UTC)** against `https://tickroom-bench.vercel.app`:
@@ -353,6 +373,39 @@ Three more caveats worth carrying with every number above:
 - **The Upstash database's region is unknown**, and it is a shared database
   rather than one provisioned for this bench. Nothing here separates a slow
   region from a slow provider.
+
+### The input timeline off-by-one, 2026-09-03
+
+Playing the deployment by hand surfaced it before any script did: press a
+direction key and the paddle on screen ran slightly behind for a moment,
+crept back to where it should have been, and then lurched again about 200ms
+after the key came up. `bench/paddle.mjs` turned that into a deterministic
+reproduction. Against the unpatched deployment, 4 moves produced 8 reconciles
+with a nonzero error, every one of them exactly one tick of travel (4.5
+units, at 90 units per second and a 20Hz tick), positive by 110 to 125ms
+after each press and negative by 200 to 230ms after each release. Each
+release also carried exactly one direction flip in the drawn paddle. Max
+correction offset was 3.6 to 3.7 units, the client's lead over the snapshot
+held at 3 to 4 ticks throughout, and window shortfalls stayed at zero, so the
+error was not a starved input queue or a lead problem: it was the input's
+effect landing on the wrong tick.
+
+The cause lived in the library, not on this page. The ticker consumed the
+input stamped for tick n just before the step that produced tick n+1, so an
+input's effect first appeared one snapshot later than the client's own
+prediction, and later than the shipped pong example, assumes. The fix, in
+tickroom 0.2.0's ticker: the step that produces tick T now consumes the
+inputs stamped T, documented on `RoomRuntime.currentTick` and pinned by two
+ticker tests that change the input mid-run. After vendoring the fixed
+tarball and redeploying, the same check on the same deployment ran 8 moves,
+203 reconciles, 0 with a nonzero error, 0 direction flips, a max offset of
+0.00, and a lead of 3 to 4 ticks: PASS.
+
+Runs A and B above were measured with the off-by-one still present. Their
+marker numbers are unaffected, because the marker is server-driven and never
+touched by a key. Their `lateInputs` and `starves` counters are not: both
+were taken with one more tick of arrival slack than the fixed library
+allows, so a run repeated today would not reproduce them exactly.
 
 ## Running locally
 
