@@ -231,8 +231,7 @@ node bench/paddle.mjs --url https://tickroom-bench.vercel.app [--room pong~6] [-
 It holds a direction key down, releases it, waits, and repeats that several
 times, counting every reconcile whose error is not zero and every direction
 flip in the DRAWN paddle after a release. A healthy deployment prints zero for
-both, and the script exits 1 on any nonzero reconcile or any post-release
-flip. It exists because `run.mjs` and `hidden-tab.mjs` both measure the
+both. It exists because `run.mjs` and `hidden-tab.mjs` both measure the
 marker, and the marker is server-driven: constant velocity, untouched by any
 key, so it can never show a disagreement in the input timeline. Steady motion
 hides a one-tick error completely; only a change in the input reveals it, as a
@@ -240,6 +239,22 @@ correction landing at exactly the moment the input changes. A player's own
 paddle is the entity actually driven by a key, predicted locally and
 reconciled against every snapshot, so this script measures that entity
 directly instead of standing in for it with the marker.
+
+**It grades two things, and prints a PASS or FAIL line for each.** The first
+is reconciliation: zero nonzero reconciles and zero post-release flips, which
+is the input timeline agreeing at both ends. The second is motion regularity
+while the key is held, and it exists because the first can pass perfectly on
+a paddle that visibly stutters. A locally predicted entity advances only when
+a tick is stamped, once per 50ms at 20Hz, while the page draws at 60fps, so
+drawn raw it holds still for two frames in three and then jumps a whole tick
+of travel. Over the middle of each hold (from 120ms after the press to 20ms
+before the release) the script counts the share of frames in which the drawn
+paddle did not move at all and the largest single-frame step, and passes when
+fewer than one frame in ten is still and the largest step is under 3 units.
+Smooth reads as near zero still frames and a step near the per-frame travel,
+which is 1.5 units at 90 units per second and 60fps; stepping reads as about
+two thirds still and a step of a whole tick, 4.5 units. The script exits 1
+when either grade fails.
 
 ## Results
 
@@ -404,8 +419,77 @@ tarball and redeploying, the same check on the same deployment ran 8 moves,
 Runs A and B above were measured with the off-by-one still present. Their
 marker numbers are unaffected, because the marker is server-driven and never
 touched by a key. Their `lateInputs` and `starves` counters are not: both
-were taken with one more tick of arrival slack than the fixed library
-allows, so a run repeated today would not reproduce them exactly.
+were taken with one more tick of arrival slack than the fixed ticker allows
+at the same headroom, and the next entry has what that cost and what was done
+about it.
+
+### The stepping paddle and the starve rate, 2026-09-03
+
+Two things followed the timeline fix, one seen by a player and one seen only
+by the room's counters, and both were measured on this deployment before
+anything was changed.
+
+**The paddle stopped rubber banding and started stepping.** With the
+reconciliation now exact, the player reported the paddle moving in visible
+steps under a held key. The cause was not a defect in the fix but the defect
+the fix had been hiding: the locally predicted paddle advances only when a
+tick is stamped, once per 50ms at 20Hz, while the page draws at 60fps, so it
+held still for two frames in three and then jumped a whole tick of travel.
+The extended `paddle.mjs` grade measured it on the deployment before the
+change: 48 held frames, 67% with no motion, largest single-frame step 4.50
+units, which is exactly one tick at 90 units per second. Remote paddles and
+the marker never show this, because the library's interpolator draws them
+between snapshots; the owned entity is the one thing on the page with no
+interpolator in front of it, and the marker-based harnesses could never have
+seen it.
+
+The fix is in two places. The library's `ClientTickView` gained `fraction`,
+how far the counter is into the next tick (0 inclusive to 1 exclusive, from
+the accumulator the counter already kept; 0 before the first anchor and after
+any anchor), pinned by five `clientTick` tests that were mutation-checked.
+This page and the library's pong example then keep the prediction one stamped
+tick behind as `prevPredictedY` and draw
+`prev + (curr - prev) * conn.tick.fraction` plus the `ErrorOffset`, shifting
+`prev` by the same delta on every reconcile so a correction is carried once,
+by the offset, and not glided a second time by the interpolation. The price
+is one tick of visual delay on the owned entity, at most 50ms at 20Hz, on top
+of a prediction that has no round trip in it; the return is motion at the
+frame rate. After vendoring and redeploying, the same check on the same
+deployment ran 8 input changes with zero corrections, a lead of 4 to 5 ticks
+over the snapshot, and while held: 95 frames, 0% with no motion, largest
+single-frame step 1.60 units against a per-frame travel of 1.5 at 90 units
+per second and 60fps. Both grades PASS. The library's suite stood at 1042
+tests across 38 files with the five new cases in.
+
+**The starve rate went up, because the off-by-one had been a free tick of
+slack.** The old consume timing applied an input one tick after the one it
+named, which meant every input had one more tick to arrive than the client's
+lead was sized for. Taking that away made the lead honest and the buffer one
+tick shallower at the same headroom. Measured with three clients for three
+minutes at about 80ms round trip, the fixed library at the old 100ms default
+headroom reported `starves` 31 in 3593 ticks, about ten a minute for the
+room, against about three a minute before the fix (33 in 11972 ticks over
+run B's ten minutes), with `lateInputs` 16 and one tick re-anchor per client.
+Two responses were tried, each measured on its own three-minute run.
+
+1. **Tightening the feedback loop's deadband from two ticks to one, so a
+   buffer running one tick deep gets lifted: worse, and reverted.** Re-anchors
+   per client per three minutes went from 1 to 4, 6 and 8, `starves` went from
+   31 to 44, and `lateInputs` from 16 to 13. Every correction clears the
+   client's stamped window, and with the band at one tick the loop hunted
+   between depths of one and three instead of settling. The deadband equals
+   the target by decision now, and the measurement is recorded in the
+   library beside the loop and in its architecture document.
+2. **Raising the default headroom, `DEFAULT_INPUT_LEAD_MS`, from 100 to
+   150: kept.** One more tick of jitter headroom at 20Hz gives back the slack
+   the off-by-one had been giving for free, at the same total latency the old
+   timing had, with the input now landing on the tick it names. On that build
+   the same three-minute run reported `starves` 8 in 3610 ticks and
+   `lateInputs` 2, `refusedInputs` 0, `hostErrors` 0, tick rate 19.96 to
+   20.98 Hz over 179 of 180 flushes; tick re-anchors 0, 1 and 1 per client
+   (largest delta 3), zero reconnects, zero backward, zero-motion and blank
+   frames, and a median round trip of 83 to 83.5ms. That is about three a
+   minute, the rate the unfixed library had, with the reconciliation exact.
 
 ## Running locally
 
@@ -461,6 +545,7 @@ sim/
 bench/
   run.mjs                   N clients, M minutes, JSON plus a markdown summary
   hidden-tab.mjs            one client backgrounded, then brought back
+  paddle.mjs                one client, a held key: reconciliation and motion regularity
   analyse.mjs               the library's own smoothness analysis, ported
   page.mjs                  what both harnesses need from a page, once
 vendor/
