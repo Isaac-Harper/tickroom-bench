@@ -221,6 +221,139 @@ those rather than the fresh `about:blank` the mode is written against, and the
 client never mints. Measured: a fresh profile seated in fifteen seconds, and the
 next two runs on the kept profile timed out waiting for a player id.
 
+## Results
+
+Measured on **2026-09-03 (UTC)** against `https://tickroom-bench.vercel.app`:
+Vercel project `tickroom-bench` in a personal org on the **Hobby** plan, Next.js
+App Router, **Fluid compute**, Node 24, `maxDuration = 300` and
+`maxDurationS: 300` on both long-lived routes, namespace `bench`, base id
+`pong`. Redis is a shared **Upstash** database over TLS (`rediss://`), about 80
+to 87ms round trip from the laptop. The library is `tickroom` 0.2.0 from
+`vendor/`. Clients are headless Chromium driven by Playwright at 60fps with
+`?bot=1`, except run C, which is a real windowed browser process. Every number
+below comes out of a file in `bench/out/`, named under its run.
+
+### Run A: three clients, twelve minutes, room `pong` (03:56 to 04:08)
+
+`bench/out/2026-09-03T03-56-43-162Z.json`
+
+| client | frames | backward | zero-motion | blank | peak u/s | mean u/s | max snapshot gap | max serverTime gap | reconnects | swaps ok/att/failed | re-anchors (max ticks) | stalls | terminals | rtt min/median |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| bot0 | 43,271 | **0** | 23 | **0** | 578 | 100.03 | 433ms | 8 ticks | 1 | **2/2/0** | 3 (3) | 0 | 0 | 78/82ms |
+| bot1 | 43,255 | **0** | 0 | **0** | 115 | 100 | 184ms | 3 ticks | 0 | **2/2/0** | 1 (3) | 0 | 0 | 78/83ms |
+| bot2 | 43,229 | **0** | 14 | **0** | 1395 | 100 | 433ms | 5 ticks | 0 | **2/2/0** | 1 (3) | 0 | 0 | 78/84ms |
+
+The room itself, over 709 of 720 stats flushes: `starves` 43, `lateInputs` 23,
+`refusedInputs` 0, `hostErrors` 0, `publishSkipped` 0, `publishFails` 0,
+`renewFails` 0, 14,367 publishes, tick rate 19.84 to 21.55Hz, 6.2MB published
+and 19.1MB delivered, **peak 8 Redis connections**.
+
+Two ticker handoffs happened. The Vercel log shows successor invocations at
+03:59:54 and 04:04:21, both `ticker.restore` from the checkpoint, and **only the
+second was visible to the clients** as an instance-id change, because Fluid
+compute ran the first standby in the same warm container as the incumbent and
+the app's instance id was still at module scope. That is the bug the file map's
+note on `app/api/ticker/route.ts` describes, and it was fixed to per invocation
+before run B. The visible handoff cost an arrival gap of **66ms** on a 50ms grid
+with a server grid gap of **50ms**, so no tick went missing. Two things this run
+could not answer and run B could: bot0's single reconnect at 43s has no recorded
+close code, and the two 433ms gaps could not be placed in time, because the page
+recorded neither closes nor gap timestamps yet.
+
+### Run B: three clients, ten minutes, room `pong` (04:32 to 04:42)
+
+`bench/out/2026-09-03T04-32-28-532Z.json`, with per-invocation ticker ids,
+socket close codes and gap timestamps all recorded.
+
+| client | frames | backward | zero-motion | blank | peak u/s | mean u/s | max snapshot gap | max serverTime gap | reconnects | swaps ok/att/failed | re-anchors (max) | stalls | terminals | rtt min/median |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| bot0 | 36,068 | **0** | 9 | **0** | 190 | 100 | 367ms | 7 ticks | **0** | **2/2/0** | 0 (0) | 0 | 0 | 78/85ms |
+| bot1 | 36,039 | **0** | 6 | **0** | 604 | 100 | 400ms | 4 ticks | **0** | **2/2/0** | 1 (3) | 0 | 0 | 81/85ms |
+| bot2 | 36,010 | **0** | 6 | **0** | 138 | 100 | 283ms | 5 ticks | **0** | **2/2/0** | 1 (2) | 0 | 0 | 79/85ms |
+
+Both ticker handoffs were seen by all three clients: at 270s (`ab3ee73b` to
+`86959e25`) an arrival gap of 49.8 to 49.9ms, and at 538s (`86959e25` to
+`65f07b5e`) one of 49.2 to 66.6ms, with a server grid gap of exactly **50ms**
+both times. A planned handoff on a real platform therefore costs **no server
+tick** and at most one extra frame of arrival jitter. Every client attempted two
+relay warm swaps and completed both, none failed, and each retired socket closed
+**1005 clean** about three seconds after adoption, at 288s and 573s.
+
+Snapshot arrival gaps over 250ms, with their timestamps: bot0 one (367ms at
+495s, nothing in the client's own events within 2s); bot1 two (250ms at 111s,
+and 400ms at 570s, which is 0.7s **before** its second swap began, so on the old
+relay just as it announced expiry); bot2 two (283ms at 143s and 265ms at 600s,
+nothing near either).
+
+The room: `starves` 33, `lateInputs` 26, `refusedInputs` 0, `hostErrors` 0,
+`publishFails` 0, `renewFails` 0, 11,972 publishes, tick rate 19.96 to 21.01Hz,
+5.1MB published and 15.2MB delivered, peak players 3, **peak 8 Redis
+connections**. The deployment's own logs over the whole session carried only 200
+and 101 responses: no 5xx, no function timeout, and no warn or error line.
+
+### Run C: one genuinely hidden tab, 6.5 minutes, room `pong~2` (04:32 to 04:40)
+
+`bench/out/hidden-2026-09-03T04-32-26-458Z.json`, `--chrome` mode: Chrome for
+Testing 151 driven over CDP with Playwright's focus emulation disabled.
+
+| | measured |
+| --- | --- |
+| tab state | `document.hidden` true, `visibilityState` hidden, **1 frame rendered** in 6.5 minutes |
+| client pings | 15 per 30s for the first minute (the 2s cadence), then **about one a minute** from the second minute onward; 46 in total |
+| socket | open the whole time, **0 reconnects**, still in the roster on return |
+| crossed while hidden | 1 relay warm swap, attempted and succeeded (old socket closed 1005), and 1 ticker handoff |
+| terminals | none |
+| recovery on show | first rendered frame at **1.05s**, drawn in the roster again at 1.05s |
+| tick re-anchors | 200, max delta 43 ticks |
+| liveness | at one ping a minute the **90s** default held; the old 45s default would have reaped this socket |
+
+Chromium throttled the ping interval far earlier than the five minutes the
+library's docs assumed. The re-anchors are not a fault: `frame()` never runs
+while the tab is dark, so every snapshot re-anchors the counter, and a host's
+`onTickReanchor` fires about every 2s for as long as the tab stays hidden.
+
+### Cold start and join latency
+
+First snapshot after the page's first rendered frame:
+
+| | measured | file |
+| --- | --- | --- |
+| the room's ticker had to be spawned cold by the relay | **1016ms** | `bench/out/2026-09-03T03-55-24-909Z.json` |
+| joining a room already running | **351, 533, 351ms** | `bench/out/2026-09-03T03-56-43-162Z.json` |
+| joining a room already running, a later two-client smoke | **617, 534ms** | `bench/out/2026-09-03T04-29-08-082Z.json` |
+
+Each figure is a mint, an upgrade and a first snapshot at about 80ms round trip.
+
+### What the runs do not prove
+
+**The 250 to 433ms band is the platform's pub/sub tail, and it is unattributed.**
+On this path (a Vercel function, to Upstash over TLS, to another Vercel
+function, to a browser 80ms away) arrival gaps of 150 to 250ms land about once a
+minute per client and gaps of 250 to 433ms about once per five client-minutes,
+with nothing in the library's own events near most of them. The interpolator
+absorbs the first band outright; the second shows as 6 to 23 motionless frames
+and then a catch-up peaking at 600 to 1400 u/s on a 100 u/s marker, which is a
+visible hitch of about a third of a second a few times an hour per client.
+Across all 73 client-minutes: zero backward steps, zero blank frames, mean speed
+exactly 100. The library's loopback harness never sees a gap above 149ms, so the
+band belongs to the network path rather than to tickroom's scheduling. A host's
+lever is the interpolation delay floor, trading roughly 200ms of remote-entity
+latency for absorbing the second band; the measurements worth making next are a
+same-region Redis and an in-function latency probe.
+
+Three more caveats worth carrying with every number above:
+
+- **Chrome for Testing, not Google Chrome.** `--chrome` prefers a real installed
+  Google Chrome and falls back to Playwright's own Chromium build, and this
+  machine has no Google Chrome, so run C is Chromium's official build running as
+  a real windowed process. Safari and mobile are untested entirely.
+- **The clients are a laptop about 80ms away**, on residential wifi, not another
+  machine in the deployment's region. Every client-side gap carries that round
+  trip in it.
+- **The Upstash database's region is unknown**, and it is a shared database
+  rather than one provisioned for this bench. Nothing here separates a slow
+  region from a slow provider.
+
 ## Running locally
 
 ```bash
