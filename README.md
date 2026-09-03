@@ -229,9 +229,10 @@ node bench/paddle.mjs --url https://tickroom-bench.vercel.app [--room pong~6] [-
 ```
 
 It holds a direction key down, releases it, waits, and repeats that several
-times, counting every reconcile whose error is not zero and every direction
-flip in the DRAWN paddle after a release. A healthy deployment prints zero for
-both. It exists because `run.mjs` and `hidden-tab.mjs` both measure the
+times, counting every reconcile past the first (which only snaps onto the
+spawn pose) whose error is above 0.25 units, below which is quantisation
+noise from the snapshot's y rounded to a tenth, plus every direction flip in
+the DRAWN paddle after a release. A healthy deployment prints zero for both. It exists because `run.mjs` and `hidden-tab.mjs` both measure the
 marker, and the marker is server-driven: constant velocity, untouched by any
 key, so it can never show a disagreement in the input timeline. Steady motion
 hides a one-tick error completely; only a change in the input reveals it, as a
@@ -490,6 +491,52 @@ Two responses were tried, each measured on its own three-minute run.
    (largest delta 3), zero reconnects, zero backward, zero-motion and blank
    frames, and a median round trip of 83 to 83.5ms. That is about three a
    minute, the rate the unfixed library had, with the reconciliation exact.
+
+### The predicted entity's render seams, 2026-09-03
+
+The hand-rolled prediction on this page, and the one in the library's own
+pong example, is gone. Both now build a `PredictedEntity` off four options,
+`conn`, `step`, `maxSpeed` and `initial`, and nothing else, and call
+`advance` once a frame and `reconcile` once a snapshot; the four coupled
+rules a consumer used to hand-write, stamp, predict, replay into an offset,
+draw between tick states, live in the library now.
+
+An adversarial review of the first version found three render seams, all in
+the half that draws the owned entity between its stamped ticks rather than in
+the reconciliation, which was already exact. A forward re-anchor, the
+`inputLead` loop's own answer to a starving buffer, teleported the draw: the
+counter jumped several ticks in one frame and a render that followed the
+counter followed it there, with no glide and nothing counting it. A backward
+re-anchor of one tick, the ordinary epoch anchor on a link under 50ms, walked
+the draw backward by a whole tick of travel. And a run of corrections each
+inside the snap distance but together past it was trimmed at the clamp in
+silence, so an offset could be capped with no record that it had happened.
+
+The fix redesigns the render half around a playhead that slews through the
+prediction's own pose history instead of following the tick counter
+directly: it moves at up to ten percent over real time, never runs backward,
+and only jumps when the target is more than four ticks away, which is
+counted as a snap. The snap gate moved too, onto the offset an absorb would
+actually produce rather than the size of one correction, which is what makes
+the silent trim above impossible now. A `NaN` or any other non-finite pose is
+refused and counted rather than absorbed, and the timestep is read off
+`conn.tick.tickMs` instead of a duplicated option a host could get wrong
+against it.
+
+`bench/paddle.mjs` against the deployed rewrite: 8 moves, 0 corrections above
+0.25 units (the snapshot rounds y to a tenth, so the bot's analog input shows
+rounding noise below that, which the check now ignores), 0 direction flips,
+0% of held frames motionless, largest single-frame step 1.59 units, lead 4
+to 11 ticks over the snapshot. The library's own suite: 1085 tests across 39
+files on a quiet machine; nine wall-clock cases fail under heavy load and
+pass alone, documented in the library itself rather than here.
+
+Also folded into this deployment: the relay's inbound flood guard defaults
+moved from capacity 40, refill 25 per second, to capacity 100, refill 70 per
+second, so a stamped client at 30 or 60Hz, one packet per tick, is no longer
+at risk of its own well-behaved traffic being rate-dropped. Every run above
+was at this room's 20Hz, well under either default, so none of the numbers
+above are affected.
 
 ## Running locally
 
