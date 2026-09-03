@@ -54,11 +54,18 @@ const st = await page.evaluate(() => window.__bench.stats());
 await browser.close();
 
 const rec = ev.filter((e) => e.kind === 'reconcile');
-const nonzero = rec.filter((e) => e.detail.error !== 0);
+// A real correction is a whole tick of travel (4.5 units here). The snapshot
+// rounds a paddle's y to a tenth, so a replay from it can differ from the
+// prediction by up to 0.05 whenever the input is analog (the bot steers by a
+// sine); that is quantisation the glide absorbs invisibly, not a timeline
+// error. The first reconcile is the initial snap onto the spawn pose and is
+// skipped too.
+const ERROR_TOLERANCE = 0.25;
+const nonzero = rec.slice(1).filter((e) => Math.abs(e.detail.error) > ERROR_TOLERANCE);
 const lags = rec.map((e) => e.detail.tick - e.detail.snapTick);
 console.log(`room ${room}, rtt ${st.rttMs.toFixed(1)}ms, ${moves} moves of ${hold}ms, ${fr.length} frames, ${rec.length} reconciles`);
 console.log(`lead over the snapshot: ${Math.min(...lags)} to ${Math.max(...lags)} ticks, window shortfalls: ${rec.filter((e) => e.detail.missing > 0).length}`);
-console.log(`reconciles with a nonzero error: ${nonzero.length}`);
+console.log(`reconciles with an error above ${ERROR_TOLERANCE} units: ${nonzero.length}`);
 if (nonzero.length) {
   console.log(
     '  (ms from nearest release: error) ' +
