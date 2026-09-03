@@ -59,7 +59,7 @@ interface PongSnapshot {
   inputLead?: number | undefined;
 }
 
-/** Must equal `pongRuntime.tickHz` and `TICK_HZ` in lib/rooms.ts. Stated once and used twice below (the connection's basis and the prediction's timestep). */
+/** Must equal `pongRuntime.tickHz` and `TICK_HZ` in lib/rooms.ts. Stated once for the connection; the prediction reads its timestep off `conn.tick.tickMs`. */
 const TICK_HZ = 20;
 
 /** Where a paddle sits for each side. The server owns the assignment; this is only where to draw it. */
@@ -390,14 +390,15 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
   //
   // Once per frame `advance` stamps a record for every tick the counter
   // crossed, predicts each through `step`, sends the last six as one JSON array
-  // (what the relay's `decodeInput` parses), and returns the pose to draw,
-  // interpolated across the last stamped tick by `conn.tick.fraction` with what
-  // is left of the last correction added. Once per snapshot `reconcile` replays
-  // and re-seats. The x never changes under `step`; the first reconcile seats
-  // it on the side the server chose.
+  // (what the relay's `decodeInput` parses), and returns the pose to draw: the
+  // pose history read at a render playhead that moves at real time (within a
+  // tenth) one tick behind the newest stamp, with what is left of the last
+  // correction added, so a counter re-anchor is caught up over a second
+  // rather than drawn as a lurch. Once per snapshot `reconcile` replays and
+  // re-seats. The x never changes under `step`; the first reconcile seats it
+  // on the side the server chose. The timestep is `conn.tick.tickMs`.
   const paddle = new PredictedEntity<{ dir: number }>({
     conn,
-    tickHz: TICK_HZ,
     // THE SAME FUNCTION THE SIMULATION RUNS, on the same input, on the tick the
     // record names.
     step: (pose, input, dt) => ({ x: pose.x, y: stepPaddleY(pose.y, input.dir, dt) }),
