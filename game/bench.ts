@@ -76,7 +76,9 @@ export interface BenchEvent {
     | 'handoff'
     | 'rate-mismatch'
     | 'mint-error'
-    | 'roster';
+    | 'roster'
+    /** The underlying socket's own close, with its code and reason. Not something the library reports: it turns a close into a status change and a reconnect, and the code is gone by then. See `BenchSocket` in `game/pong.ts` for the seam that sees it. */
+    | 'close';
   detail: Record<string, unknown>;
 }
 
@@ -84,7 +86,7 @@ export interface BenchEvent {
 export interface BenchApi {
   /** `conn.status`. */
   status(): string;
-  /** `conn.stats()`, verbatim, plus the two counters the connection does not keep. */
+  /** `conn.stats()`, verbatim, plus the counters the connection does not keep: the roster size, the two ring-buffer drop counts, and `pingsSent`, which is the one number that separates a hidden tab whose timers were throttled from one whose socket simply died. */
   stats(): Record<string, unknown>;
   /** Every frame since the last call, oldest first, and clears the buffer. */
   frames(): BenchFrame[];

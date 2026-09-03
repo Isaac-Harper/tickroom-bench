@@ -32,7 +32,8 @@ import { fileURLToPath } from 'node:url';
 
 import { chromium } from 'playwright';
 
-import { analyse, summariseRoomStats, TICK_MS } from './analyse.mjs';
+import { analyse, summariseRoomStats, GAP_REPORT_MS, TICK_MS } from './analyse.mjs';
+import { waitForPid } from './page.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -128,6 +129,29 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * happened instead of ending the run: a bench that aborts on the first blip
  * cannot measure a deployment whose whole point is surviving blips.
  */
+/**
+ * How many of those connections are in subscribe mode, WHEN THE SERVER SAYS.
+ *
+ * A real Redis answers `CLIENT LIST` with `flags=`, `sub=`, `psub=` and `ssub=`
+ * on every line, and a subscriber is any of the counts being nonzero or `P` in
+ * the flags. `S` is NOT one of them however tempting the letter looks: it is a
+ * replica connection, and counting replicas as subscribers would inflate the
+ * one number this whole section exists to report.
+ *
+ * UPSTASH REPORTS NONE OF THEM. Measured against the deployment's own database
+ * (Upstash 1.17.11, Redis 8.2.0) with a subscriber deliberately open: every
+ * line comes back as `id addr laddr db name lib-name lib-ver` and stops. So the
+ * old regex matched nothing and the run reported `0 in subscribe mode` while a
+ * ticker subscriber and a relay subscriber per socket were certainly live,
+ * which is not a small number, it is a wrong one. `null` is the honest answer
+ * and the summary prints it as text rather than as a zero.
+ */
+function countSubscribers(lines) {
+  const reported = lines.some((l) => / (?:sub|psub|ssub)=| flags=/.test(l));
+  if (!reported) return null;
+  return lines.filter((l) => / (?:sub|psub|ssub)=[1-9]/.test(l) || / flags=\S*P/.test(l)).length;
+}
+
 async function drain(page) {
   return page.evaluate(() => {
     const b = window.__bench;
@@ -202,7 +226,11 @@ async function main() {
     target.searchParams.set('name', rec.name);
     await page.goto(target.toString(), { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => Boolean(window.__bench), null, { timeout: READY_TIMEOUT_MS });
-    rec.pid = await page.evaluate(() => window.__bench.pid());
+    // WAITS FOR THE MINT AND NOT JUST FOR THE HOOK. The page publishes
+    // `window.__bench` before `conn.start()`, so `pid()` answers `''` until
+    // `/api/session` comes back; see `bench/page.mjs` for what reading it a
+    // moment too early cost the hidden-tab harness.
+    rec.pid = await waitForPid(page);
     clients.push(rec);
     console.error(`[bench] client ${i} up`);
   }
@@ -268,8 +296,7 @@ async function main() {
         // place it can be read from.
         const list = await redis.call('CLIENT', 'LIST');
         const lines = String(list).split('\n').filter((l) => l.trim() !== '');
-        const subscribers = lines.filter((l) => / cmd=subscribe| sub=[1-9]/.test(l)).length;
-        clientCounts.push({ atMs: Date.now() - runStart, total: lines.length, subscribers });
+        clientCounts.push({ atMs: Date.now() - runStart, total: lines.length, subscribers: countSubscribers(lines) });
       } catch (err) {
         redisErrors.push(`client-list: ${String(err && err.message ? err.message : err)}`);
       }
@@ -346,6 +373,19 @@ async function main() {
   return 0;
 }
 
+/** The one field of an event's detail worth putting next to a gap. A whole `detail` object per line would bury the answer it exists to give. */
+function describeNear(e) {
+  const d = e.detail ?? {};
+  if (e.kind === 'status') return ` ${d.status}`;
+  if (e.kind === 'close') return ` ${d.code}${d.wasClean ? '' : ' unclean'}`;
+  if (e.kind === 'reanchor') return ` delta ${d.delta}`;
+  if (e.kind === 'swap') return ` ${d.relaySwaps}/${d.swapsAttempted}/${d.swapsFailed}`;
+  if (e.kind === 'handoff') return ` ${d.from} to ${d.to}`;
+  if (e.kind === 'stall') return d.stalled ? ' on' : ' off';
+  if (e.kind === 'terminal') return ` ${d.reason}`;
+  return '';
+}
+
 function renderMarkdown(result, file) {
   const lines = [];
   lines.push(`# tickroom bench, ${result.startedAt}`);
@@ -386,7 +426,9 @@ function renderMarkdown(result, file) {
     const a = c.analysis;
     const rs = a.rendered.resumeSteps;
     const hs = a.snapshotGap.handoffs;
-    if (rs.length === 0 && hs.length === 0 && a.events.terminals.length === 0) continue;
+    const wide = a.snapshotGap.over150.filter((g) => g.gapMs >= GAP_REPORT_MS);
+    const cs = a.events.closes;
+    if (rs.length === 0 && hs.length === 0 && wide.length === 0 && cs.length === 0 && a.events.terminals.length === 0) continue;
     lines.push(`### ${c.name}`);
     lines.push('');
     if (hs.length) {
@@ -399,6 +441,29 @@ function renderMarkdown(result, file) {
     if (rs.length) {
       lines.push(`Resume steps across an epoch boundary: ${rs.length}.`);
       for (const r of rs) lines.push(`- at ${(r.atMs / 1000).toFixed(1)}s, dx ${r.dx}, ${r.speed} u/s`);
+      lines.push('');
+    }
+    if (wide.length) {
+      // PLACED IN TIME AND NEXT TO WHATEVER WAS HAPPENING. A gap that sits on a
+      // swap is that swap's adoption cost; the same gap with nothing near it is
+      // the network or the room, and the two used to be one number in a list.
+      lines.push(`Snapshot arrival gaps over ${GAP_REPORT_MS}ms: ${wide.length}.`);
+      for (const g of wide) {
+        const near = (g.near ?? []).map((e) => `${e.kind}${describeNear(e)} ${e.dtMs >= 0 ? '+' : ''}${(e.dtMs / 1000).toFixed(1)}s`);
+        lines.push(
+          `- at ${(g.atMs / 1000).toFixed(1)}s, ${g.gapMs}ms, epoch ${g.epoch}` +
+            (near.length ? `, near: ${near.join('; ')}` : ', nothing within 2s')
+        );
+      }
+      lines.push('');
+    }
+    if (cs.length) {
+      lines.push(`Socket closes: ${cs.length}.`);
+      for (const x of cs) {
+        lines.push(
+          `- at ${(x.atMs / 1000).toFixed(1)}s, code ${x.code}${x.reason ? ` "${x.reason}"` : ''}, ${x.wasClean ? 'clean' : 'not clean'}`
+        );
+      }
       lines.push('');
     }
     if (a.events.terminals.length) {
@@ -424,8 +489,19 @@ function renderMarkdown(result, file) {
     lines.push('');
     if (r.clientCounts.length) {
       const peak = r.clientCounts.reduce((m, c) => Math.max(m, c.total), 0);
-      const peakSub = r.clientCounts.reduce((m, c) => Math.max(m, c.subscribers), 0);
-      lines.push(`Redis connections, peak: ${peak} total, ${peakSub} in subscribe mode. Every relay socket holds its own subscriber, so the second number is the one that meets a managed plan's ceiling first.`);
+      const counted = r.clientCounts.filter((c) => typeof c.subscribers === 'number');
+      const sub = counted.length
+        ? `${counted.reduce((m, c) => Math.max(m, c.subscribers), 0)} in subscribe mode`
+        : 'subscribe mode not reported by this Redis';
+      lines.push(`Redis connections, peak: ${peak} total, ${sub}. Every relay socket holds its own subscriber, so the second number is the one that meets a managed plan's ceiling first.`);
+      if (!counted.length) {
+        lines.push('');
+        lines.push(
+          "This database's `CLIENT LIST` answers `id addr laddr db name lib-name lib-ver` and nothing else: " +
+            'no `flags=`, no `sub=`, no `psub=`. The split cannot be counted here and is not reported as zero, ' +
+            'which is what it used to be. The total is real, and `connected_clients` from `INFO clients` agrees with it.'
+        );
+      }
       lines.push('');
     }
     if (r.errors.length) {

@@ -48,6 +48,24 @@ export const TICK_MS = 1000 / TICK_HZ;
  */
 export const STEADY_LEAD_MS = 3000;
 
+/**
+ * A snapshot arrival gap wide enough to name individually, ms.
+ *
+ * The 150ms bar below is the library's and does not move. This is a second,
+ * higher bar at which a gap stops being a number in a list and gets its own
+ * line with the events around it, because a bare list of milliseconds cannot be
+ * placed in time at all: the 2026-09-03 run reported a 433ms gap on two of
+ * three clients and there was no way to tell one platform event seen twice from
+ * two unrelated pauses.
+ */
+export const GAP_REPORT_MS = 250;
+
+/** How far either side of a gap an event is still a candidate explanation. Two seconds covers a warm swap's whole attempt-and-adopt sequence and a reconnect's first ladder step. */
+const GAP_CONTEXT_MS = 2000;
+
+/** The event kinds that can explain a hole in the snapshot stream. A roster frame or a mint error cannot, and listing those would bury the ones that can. */
+const GAP_CONTEXT_KINDS = new Set(['status', 'close', 'swap', 'handoff', 'reanchor', 'stall', 'terminal']);
+
 function percentile(sorted, p) {
   if (sorted.length === 0) return null;
   const i = Math.min(sorted.length - 1, Math.max(0, Math.round((p / 100) * (sorted.length - 1))));
@@ -153,7 +171,11 @@ export function analyse(frames, events, statsSeries, endStats, t0, steadyLeadMs 
     if (prevArrivalT !== null) {
       const g = f.t - prevArrivalT;
       if (g > maxGap) maxGap = g;
-      if (g > 150) over150.push(+g.toFixed(1));
+      // TIMESTAMPED, NOT JUST MEASURED. `atMs` is on the same page-relative
+      // clock as every event below, which is the only thing that lets a gap be
+      // lined up with a swap, a handoff or a reconnect rather than filed as an
+      // anonymous number. `epoch` says whether the gap crossed a socket.
+      if (g > 150) over150.push({ atMs: +(f.t - t0).toFixed(1), gapMs: +g.toFixed(1), epoch: f.epoch });
       const sg = f.serverTime - prevServerTime;
       if (sg > maxServerGapMs) maxServerGapMs = sg;
       if (f.inst !== prevInst) {
@@ -182,9 +204,36 @@ export function analyse(frames, events, statsSeries, endStats, t0, steadyLeadMs 
     if (Math.abs(dev) > Math.abs(maxDev)) maxDev = dev;
   }
 
+  // WHAT THE CLIENT WAS DOING AROUND THE WIDE GAPS. Attached to the gap rather
+  // than left for a reader to correlate by eye, because that correlation is the
+  // whole question a gap raises: a 400ms hole that sits on a swap is the swap's
+  // adoption cost and expected, and the same hole with nothing near it is the
+  // network or the room, which is not.
+  const contextEvents = events
+    .filter((e) => GAP_CONTEXT_KINDS.has(e.kind))
+    .map((e) => ({ kind: e.kind, atMs: +(e.t - t0).toFixed(1), detail: e.detail }));
+  for (const g of over150) {
+    if (g.gapMs < GAP_REPORT_MS) continue;
+    g.near = contextEvents
+      .filter((e) => Math.abs(e.atMs - g.atMs) <= GAP_CONTEXT_MS)
+      .map((e) => ({ ...e, dtMs: +(e.atMs - g.atMs).toFixed(1) }));
+  }
+
   const reanchors = events
     .filter((e) => e.kind === 'reanchor')
     .map((e) => ({ atMs: +(e.t - t0).toFixed(1), delta: e.detail.delta }));
+  // The socket's own close, code and all. The library turns a close into a
+  // status change and a reconnect and the code is gone by then, so a run that
+  // reconnected once could say that it happened and nothing about why. See
+  // `BenchSocket` in `game/pong.ts` for the seam this comes through.
+  const closes = events
+    .filter((e) => e.kind === 'close')
+    .map((e) => ({
+      atMs: +(e.t - t0).toFixed(1),
+      code: e.detail.code,
+      reason: e.detail.reason,
+      wasClean: e.detail.wasClean,
+    }));
   const terminals = events
     .filter((e) => e.kind === 'terminal')
     .map((e) => ({ atMs: +(e.t - t0).toFixed(1), reason: e.detail.reason, room: e.detail.room }));
@@ -236,7 +285,7 @@ export function analyse(frames, events, statsSeries, endStats, t0, steadyLeadMs 
       rttMinMs: sortedRtt.length ? sortedRtt[0] : null,
       rttMedianMs: percentile(sortedRtt, 50),
     },
-    events: { terminals, stalls, swaps: swapEvents, handoffs: clientHandoffEvents },
+    events: { terminals, stalls, swaps: swapEvents, handoffs: clientHandoffEvents, closes },
   };
 }
 

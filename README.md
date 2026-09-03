@@ -135,7 +135,7 @@ node bench/run.mjs --url https://tickroom-bench.vercel.app \
   --clients 3 --minutes 12 --redis "$REDIS_URL"
 
 # the hidden-tab run: one client backgrounded for 6.5 minutes, then brought back
-node bench/hidden-tab.mjs --url https://tickroom-bench.vercel.app --minutes 6.5
+node bench/hidden-tab.mjs --url https://tickroom-bench.vercel.app --minutes 6.5 --chrome
 ```
 
 Both write a timestamped JSON to `bench/out/` and print a markdown summary to
@@ -157,6 +157,14 @@ one that matters at scale: every relay socket holds its own subscriber, because
 a connection in subscribe mode cannot run ordinary commands, so concurrent
 connections is the first ceiling this architecture hits and not command count.
 
+**Upstash does not report the split, and the run now says so instead of saying
+zero.** A real Redis answers `CLIENT LIST` with `flags=`, `sub=`, `psub=` and
+`ssub=` on every line; this deployment's database (Upstash 1.17.11 in front of
+Redis 8.2.0) answers `id addr laddr db name lib-name lib-ver` and stops. So the
+count matched nothing and the summary read `0 in subscribe mode` while a ticker
+subscriber and one subscriber per relay socket were certainly live. The total is
+real and agrees with `connected_clients`; the split prints as not reported.
+
 Two things worth knowing about how it samples:
 
 - **Every client gets its own browser context**, not another tab. Tabs in one
@@ -170,13 +178,48 @@ Two things worth knowing about how it samples:
   so a 5 second poll would see one flush in five and under-report every counter
   by a factor of five while still looking plausible.
 
-`bench/hidden-tab.mjs` removes three flags Playwright passes by default
-(`--disable-background-timer-throttling`,
-`--disable-backgrounding-occluded-windows`,
-`--disable-renderer-backgrounding`). Those exist so ordinary tests are not
-flaky, and they are precisely the behaviour being measured; a run that left them
-in would report a hidden tab behaving perfectly, which is a true statement about
-a browser nobody uses.
+**`bench/hidden-tab.mjs` needs `--chrome`, and without it the run is worthless.**
+Two separate things stop Playwright from ever backgrounding a tab, and only one
+of them is a launch flag:
+
+- **Three default flags.** Playwright launches Chromium with
+  `--disable-background-timer-throttling`,
+  `--disable-backgrounding-occluded-windows` and
+  `--disable-renderer-backgrounding` so ordinary tests are not flaky. Those are
+  precisely the behaviour being measured, so both modes remove them.
+- **`Emulation.setFocusEmulationEnabled`, which is the one that actually bit.**
+  Playwright sends it, enabled, to every main frame it attaches to, and the
+  renderer then simulates a focused and active document forever: `document.hidden`
+  stays false however the tab is occluded and `requestAnimationFrame` never
+  stops. The 2026-09-03 run reported `hidden=false` and 1800 frames on every
+  30 second sample of a "backgrounded" tab, because the tab was never
+  backgrounded.
+
+`connectOverCDP` with `noDefaults` is the only documented way off it, and it
+applies only to pages in the browser's own default context, which a
+Playwright-launched browser does not have. So `--chrome` starts a real browser
+process (Google Chrome if it is installed, Playwright's own Chromium build
+otherwise) with a throwaway profile under `bench/out/chrome-profile`, attaches
+over CDP, opens both tabs in the context the browser already had, and quits that
+process with `Browser.close` at the end. The throwaway profile is what makes it
+a separate process: an already running browser is never touched.
+
+The mode then **proves** the tab went dark before spending six and a half
+minutes on the assumption. It reads `document.hidden` back after activating the
+second tab, retries once through `Target.activateTarget`, and aborts with a
+message rather than measuring a foreground tab. Measured on an M-series Mac:
+`hidden` true, `visibilityState` hidden, and zero rAF callbacks in five seconds,
+against 187 in the same five seconds without `noDefaults`.
+
+The Playwright-launched mode is still the default and still runs; it says
+loudly, in the log and in its own summary, that it measured nothing.
+
+**The profile is deleted at the start of every `--chrome` run, and has to be.**
+A kept one makes the second run of the day a different experiment: Chrome
+restores the previous session's tabs, so the page the harness picks up is one of
+those rather than the fresh `about:blank` the mode is written against, and the
+client never mints. Measured: a fresh profile seated in fifteen seconds, and the
+next two runs on the kept profile timed out waiting for a player id.
 
 ## Running locally
 
@@ -233,6 +276,7 @@ bench/
   run.mjs                   N clients, M minutes, JSON plus a markdown summary
   hidden-tab.mjs            one client backgrounded, then brought back
   analyse.mjs               the library's own smoothness analysis, ported
+  page.mjs                  what both harnesses need from a page, once
 vendor/
   tickroom-0.2.0.tgz        the dependency itself
 ```
@@ -264,9 +308,35 @@ the file.
    so the client has to be able to see the seam in order to report that it saw
    nothing at the seam. The library's own loopback harness does the same thing.
 
+   **The id is generated per INVOCATION, in `app/api/ticker/route.ts`'s `GET`,
+   and it was module scope until it lied.** A ticker spawns its own successor,
+   and Fluid compute lands that successor in the same warm container as the
+   incumbent far more often than not: the module was already evaluated, so the
+   successor re-used the incumbent's id and published the identical `inst`. A
+   handoff across a warm container was then indistinguishable from no handoff at
+   all. The 2026-09-03 run saw one of the two handoffs the platform log shows,
+   because the 03:59:54 successor carried the same `71558b37` the 03:55:27
+   incumbent had. `createTickerRoute` only validates its options and returns a
+   closure, so the route is built inside the request too, and `buildId` stays the
+   same string as `inst` so a client-side handoff still lines up with the stats
+   flush the successor wrote.
+
 `game/pong.ts` is `examples/pong/client.ts` wired exactly as the library
-README's step 3 shows, plus a bot mode, the `window.__bench` hook, and a room
-chosen by query parameter. One wiring detail differs from the README on purpose:
+README's step 3 shows, plus a bot mode, the `window.__bench` hook, a room
+chosen by query parameter, and a `WebSocketImpl` that counts.
+
+That last one is `BenchSocket`, and it exists because two numbers a bench needs
+are on the wrong side of the library's API and correctly so. **Outgoing round
+trip probes**: the ping is on the connection's own 2000ms `setInterval`, a
+`setInterval` is exactly what a browser throttles once a tab is backgrounded,
+and `rttMs` cannot show it because a sample taken across a frozen render loop is
+discarded before it reaches the window. So a socket that stayed open with a ping
+count that stopped climbing is the hidden-tab failure, and nothing else reports
+it. **The socket's close code**: the library turns a close into a status change
+and a reconnect, and the code is gone by then, so a run that reconnected once
+could say that it happened and nothing about why. `WebSocketImpl` is the
+documented seam and the connection builds every socket through it, the warm
+swap's replacement included. One wiring detail differs from the README on purpose:
 the socket URL is built with `socketUrl` rather than by setting `path`, because
 the default builder appends its own `?token=...` to whatever `path` holds and a
 `path` carrying the display-name query would produce `/api/ws?n=x?token=...`

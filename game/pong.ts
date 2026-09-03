@@ -37,6 +37,7 @@ import {
   type EntitySample,
   type SessionInfo,
 } from 'tickroom/client';
+import { PING_FRAME_PREFIX } from 'tickroom/core';
 
 import { RingBuffer, type BenchApi, type BenchEvent, type BenchFrame } from './bench';
 import { FIELD_H, FIELD_W, MARKER_SPEED, PADDLE_SPEED, readDir, stepPaddleY } from '@/sim/pong';
@@ -167,7 +168,55 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
    */
   let room = opts.room;
 
+  // ---- the socket, seen from outside the library --------------------------
+
+  /**
+   * Round-trip probes this client actually got onto the wire, lifetime.
+   *
+   * `ConnectionStats` cannot report this and should not: the ping is transport
+   * bookkeeping the connection sends on its own 2000ms `setInterval`, and a
+   * host has no business in it. A BENCH does, for one reason: a `setInterval`
+   * is precisely what a browser throttles once a tab is backgrounded, so a
+   * socket that stayed open with a ping count that stopped climbing is the exact
+   * shape of the hidden-tab failure, and `rttMs` cannot show it because a
+   * sample taken across a frozen render loop is discarded before it reaches the
+   * window.
+   */
+  let pingsSent = 0;
+
+  /**
+   * The one seam that can see a socket from outside the connection.
+   *
+   * `WebSocketImpl` is documented for supplying a non-DOM implementation, and
+   * the connection builds every socket through it including the warm swap's
+   * replacement, so a subclass sees every frame sent and every close. That is
+   * the only way this page can report either: the library consumes `ping`,
+   * `pong` and `relay-expiring` internally as transport bookkeeping, and it
+   * turns a close into a status change and a reconnect with the CODE dropped.
+   * A run that reconnected once and cannot say whether that was 1006, a 1001
+   * from a function exiting, or a policy close has measured that something
+   * happened and nothing about what.
+   *
+   * The ping match is on the library's own `PING_FRAME_PREFIX` rather than a
+   * string retyped here, because a prefix that drifted would silently count
+   * zero.
+   */
+  class BenchSocket extends WebSocket {
+    constructor(url: string) {
+      super(url);
+      this.addEventListener('close', (ev) => {
+        record('close', { code: ev.code, reason: ev.reason, wasClean: ev.wasClean });
+      });
+    }
+
+    override send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
+      if (typeof data === 'string' && data.startsWith(PING_FRAME_PREFIX)) pingsSent += 1;
+      super.send(data);
+    }
+  }
+
   const conn = new RoomConnection<PongSnapshot, string>({
+    WebSocketImpl: BenchSocket,
     // Required rather than defaulted, because a client silently running on the
     // wrong basis skews the tick counter, the server-tick estimate and the
     // underrun threshold at once.
@@ -573,6 +622,9 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       rosterSize,
       framesDropped: frameBuf.dropped,
       eventsDropped: eventBuf.dropped,
+      // See `BenchSocket`: the count of round-trip probes that reached the wire,
+      // which is what a throttled hidden tab stops producing.
+      pingsSent,
       room,
       terminal: terminalText,
       hidden: document.hidden,
