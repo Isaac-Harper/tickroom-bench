@@ -59,6 +59,11 @@ export interface BenchFrame {
   extrap: boolean | null;
   /** This client's OWN paddle as the interpolator rendered it. Its only mover is this client's own stamped inputs, so it is the per-sender half of fairness. */
   ownX: number | null;
+  /** This client's OWN paddle as it was DRAWN: the local prediction plus what is left of the last correction. The number a player's eye follows, where `ownX` is the server's delayed view of the same paddle. */
+  ownY: number | null;
+  /** The prediction alone, and the correction offset alone, so a wobble can be attributed to one or the other. */
+  predictedY: number | null;
+  errZ: number | null;
   /** Every entity this frame drew, as `[id, x, y]`. How a client's view of the ROSTER is measured rather than just its view of the marker. */
   entities: [string, number, number][];
   stalled: boolean;
@@ -77,6 +82,7 @@ export interface BenchEvent {
     | 'rate-mismatch'
     | 'mint-error'
     | 'roster'
+    | 'reconcile'
     /** The underlying socket's own close, with its code and reason. Not something the library reports: it turns a close into a status change and a reconnect, and the code is gone by then. See `BenchSocket` in `game/pong.ts` for the seam that sees it. */
     | 'close';
   detail: Record<string, unknown>;

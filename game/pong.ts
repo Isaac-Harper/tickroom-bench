@@ -327,11 +327,28 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       const mine = snap.paddles.find((p) => p.pid === selfPid);
       if (!mine) return;
       let replayed = mine.y;
+      let covered = 0;
       for (const rec of sent) {
-        if (rec.targetTick > snap.tick) replayed = stepPaddleY(replayed, rec.data.dir, DT);
+        if (rec.targetTick > snap.tick) {
+          replayed = stepPaddleY(replayed, rec.data.dir, DT);
+          covered += 1;
+        }
       }
 
       const error = predictedY - replayed;
+      // DIAGNOSTIC. How many ticks past the snapshot the prediction has run,
+      // how many of them the window could replay, and the error that left.
+      // `missing` above zero means the window is shorter than the lead, which
+      // shows on screen as a paddle that runs behind while moving and wobbles
+      // when it stops.
+      record('reconcile', {
+        snapTick: snap.tick,
+        tick: conn.tick.value,
+        covered,
+        missing: Math.max(0, lastSentTick - snap.tick - covered),
+        error: +error.toFixed(3),
+        serverY: +mine.y.toFixed(3),
+      });
       const seat = selfSide === null || Math.abs(error) > MAX_GLIDE;
       selfSide = mine.side;
       predictedY = replayed;
@@ -529,6 +546,10 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
     // frame in the measurement. Everything below this line is presentation.
     const marker = view.get('marker');
     const own = selfPid ? view.get(selfPid) : undefined;
+    // SAMPLED ONCE PER FRAME. `sample` advances the decay, so the draw below
+    // reuses this value rather than sampling again.
+    const errZ = err.sample(dt).z;
+    const ownRendered = selfSide !== null ? predictedY + errZ : null;
     const entities: [string, number, number][] = [];
     for (const [id, e] of view) entities.push([id, e.x, e.y]);
     frameBuf.push({
@@ -543,6 +564,9 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       x: marker ? marker.x : null,
       extrap: marker ? marker.extrapolated : null,
       ownX: own ? own.y : null,
+      ownY: ownRendered,
+      predictedY: selfSide !== null ? predictedY : null,
+      errZ: selfSide !== null ? +errZ.toFixed(3) : null,
       entities,
       stalled,
     });
@@ -593,7 +617,7 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
     // last correction. No interpolation delay and no round trip in it.
     if (selfSide !== null) {
       const ownX = selfSide === 'left' ? 6 : FIELD_W - 6;
-      const ownY = predictedY + err.sample(dt).z;
+      const ownY = ownRendered ?? predictedY;
       ctx.fillStyle = '#fff';
       ctx.fillRect(ownX * sx - 2, ownY * sy - 12 * sy, 4, 24 * sy);
     }
