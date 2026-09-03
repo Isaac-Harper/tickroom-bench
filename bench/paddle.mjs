@@ -38,9 +38,11 @@ await page.waitForFunction(() => window.__bench && window.__bench.status() === '
 await page.waitForTimeout(4000);
 await page.evaluate(() => { window.__bench.frames(); window.__bench.events(); });
 const releases = [];
+const presses = [];
 for (let i = 0; i < moves; i++) {
   const key = i % 2 === 0 ? 'ArrowDown' : 'ArrowUp';
   await page.keyboard.down(key);
+  presses.push(await page.evaluate(() => performance.now()));
   await page.waitForTimeout(hold);
   await page.keyboard.up(key);
   releases.push(await page.evaluate(() => performance.now()));
@@ -75,5 +77,26 @@ releases.forEach((R, i) => {
   const errs = win.map((f) => Math.abs(f.errZ ?? 0));
   console.log(`release ${i}: drawn-paddle direction flips ${flips}, max |offset| ${Math.max(0, ...errs).toFixed(2)}`);
 });
-console.log(nonzero.length === 0 && totalFlips === 0 ? 'PASS: no correction at any input change' : 'FAIL: the input timeline disagrees between client and server');
-process.exit(nonzero.length === 0 && totalFlips === 0 ? 0 : 1);
+// MOTION REGULARITY WHILE THE KEY IS HELD. A prediction that advances only
+// when a tick is stamped holds still for two frames in three at 60fps and
+// then jumps a whole tick of travel, which reads as stutter even with the
+// reconciliation perfect. Measured over the middle of each hold: the share
+// of frames in which the drawn paddle did not move at all, and the largest
+// single-frame step. Smooth is near zero still frames and a step near the
+// per-frame travel (1.5 units at 90 u/s and 60fps), not near a whole tick.
+let heldFrames = 0, stillFrames = 0, maxStep = 0;
+presses.forEach((P, i) => {
+  const win = fr.filter((f) => f.t >= P + 120 && f.t <= releases[i] - 20 && f.ownY !== null);
+  let prev = null;
+  for (const f of win) {
+    if (prev !== null) { const d = Math.abs(f.ownY - prev); heldFrames++; if (d < 0.01) stillFrames++; if (d > maxStep) maxStep = d; }
+    prev = f.ownY;
+  }
+});
+const stillShare = heldFrames ? stillFrames / heldFrames : 0;
+console.log(`while held: ${heldFrames} frames, ${(stillShare * 100).toFixed(0)}% with no motion, largest single-frame step ${maxStep.toFixed(2)} units`);
+const smooth = stillShare < 0.1 && maxStep < 3;
+const reconciled = nonzero.length === 0 && totalFlips === 0;
+console.log(reconciled ? 'PASS: no correction at any input change' : 'FAIL: the input timeline disagrees between client and server');
+console.log(smooth ? 'PASS: the drawn paddle moves every frame' : 'FAIL: the drawn paddle moves in tick-sized steps');
+process.exit(reconciled && smooth ? 0 : 1);
