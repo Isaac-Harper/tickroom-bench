@@ -4,8 +4,8 @@ A single [tickroom](https://github.com/Isaac-Harper/tickroom) room on a real
 Vercel deployment, instrumented so a robot can measure what a browser actually
 renders.
 
-**This exists because every platform claim tickroom currently makes was measured
-on loopback.** The library's own smoothness harness runs a `ws` server in the
+**This exists because, until the runs written up under Results below, every
+platform claim tickroom made was measured on loopback.** The library's own smoothness harness runs a `ws` server in the
 test process, a Redis on 127.0.0.1, and a simulated one-way delay standing in
 for a network. That measures the mechanism, which is the right thing for a test
 suite to do, and it says nothing about the platform: no cold function start, no
