@@ -12,17 +12,18 @@ import { createPongRuntime } from '@/sim/pong';
  * "Next.js can't recognize the exported `runtime` field in route", however
  * identical the value would be at runtime.
  *
- * 300 IS THE HOBBY PLAN'S HARD CAP, not a preference, and `MAX_DURATION_S`
+ * 800 IS THE PRO PLAN'S HARD CAP (300 was the first configuration, which is
+ * also the Hobby cap), not a preference, and `MAX_DURATION_S`
  * below has to be the same number: whatever this exports is the moment the
  * platform kills the function, and the loop has to be finished, checkpointed,
  * released and succeeded by then. The adapter derives `maxRunMs` as
- * `maxDurationS * 1000 - TICKER_EXIT_MARGIN_MS`, so 300 gives a 270 second tick
+ * `maxDurationS * 1000 - TICKER_EXIT_MARGIN_MS` capped at 700s, so 800 gives a 700 second tick
  * loop and therefore a planned handoff every 270 seconds. Nothing at runtime
  * can read a route module's static exports back, which is why the pair is
  * checked by eye here and by the assertion below for the parts that can be.
  */
 export const runtime = 'nodejs';
-export const maxDuration = 300;
+export const maxDuration = 800;
 
 // The page sizes its tick timeline from `TICK_HZ` and the runtime is what
 // actually paces the room. A disagreement is a silent multiplier on the tick

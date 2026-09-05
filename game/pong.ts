@@ -71,6 +71,17 @@ const MAX_REASSIGNS = 3;
 /** The bot's steering period, seconds. Slow enough that the paddle crosses the field rather than buzzing inside one clamp, which is what keeps a stamped input stream producing visible motion. */
 const BOT_PERIOD_S = 7;
 
+/**
+ * MIRRORS `DEFAULT_INPUT_LEAD_MS` IN THE LIBRARY'S OWN `client/connection.ts`,
+ * which is not exported: `RoomConnectionOptions.inputLeadMs` is optional
+ * precisely so a host can leave the library to its own default, and this page
+ * has no way to read that default back once it does. So the value the page
+ * reports on `window.__bench.stats().inputLeadMs` when `?lead=` is absent is
+ * this hand-kept copy, not a value read out of the connection. Bump it if the
+ * library's own default ever moves.
+ */
+const DEFAULT_INPUT_LEAD_MS = 150;
+
 export interface PongOptions {
   /** Room instance to join, e.g. `pong` or `pong~1`. Re-validated server side; this is a request, not an assertion. */
   room: string;
@@ -78,6 +89,14 @@ export interface PongOptions {
   name: string;
   /** Steer automatically. An unattended tab must still stamp inputs; see note 1 in the module comment. */
   bot: boolean;
+  /**
+   * Input lead override, ms, from `?lead=`. Passed straight through as
+   * `inputLeadMs`, so a sweep of the default headroom (100, 150, 200) can be
+   * run against a real deployment without rebuilding the library. Validated by
+   * the caller (`app/page.tsx`, a finite number 0 to 1000) before it reaches
+   * here; `undefined` leaves the connection on its own default.
+   */
+  leadMs?: number | undefined;
 }
 
 export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => void {
@@ -183,12 +202,19 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
     }
   }
 
+  /** What actually reaches the connection: the override if one was given, else the library's own default (mirrored above, since the library does not hand it back). Reported on `stats()` as `inputLeadMs` rather than recomputed there, so the two can never disagree. */
+  const inputLeadMs = opts.leadMs ?? DEFAULT_INPUT_LEAD_MS;
+
   const conn = new RoomConnection<PongSnapshot, string>({
     WebSocketImpl: BenchSocket,
     // Required rather than defaulted, because a client silently running on the
     // wrong basis skews the tick counter, the server-tick estimate and the
     // underrun threshold at once.
     tickHz: TICK_HZ,
+    // Left to the library's own default unless `?lead=` asked for a specific
+    // one; see `DEFAULT_INPUT_LEAD_MS` above for why the default is a mirrored
+    // constant rather than an omitted option read back from the connection.
+    inputLeadMs: opts.leadMs,
 
     mint: async (): Promise<SessionInfo> => {
       // ASK THE BALANCER ONLY AFTER A REFUSAL, not on every mint. On a first
@@ -565,6 +591,10 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       hidden: document.hidden,
       markerSpeed: MARKER_SPEED,
       tickHz: TICK_HZ,
+      // See `inputLeadMs` above: the override if `?lead=` supplied one, else
+      // the mirrored copy of the library's own default. This is what actually
+      // reached `RoomConnection`, not a recomputation of it.
+      inputLeadMs,
     }),
     frames: () => frameBuf.drain(),
     events: () => eventBuf.drain(),

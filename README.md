@@ -141,6 +141,13 @@ node bench/hidden-tab.mjs --url https://tickroom-bench.vercel.app --minutes 6.5 
 Both write a timestamped JSON to `bench/out/` and print a markdown summary to
 stdout. `node bench/run.mjs --help` lists every flag.
 
+**`--lead <ms>`** overrides the connection's input lead on every client via
+`?lead=` (the bench page validates it: a finite number 0 to 1000, else the
+override is dropped and the library's own default applies), and is reported
+back in `window.__bench.stats().inputLeadMs` and in the run's markdown header.
+It exists to sweep the default headroom (100, 150, 200) against a real
+deployment without rebuilding the library each time.
+
 **Per client**, `run.mjs` reports frames, backward steps, blank frames,
 zero-motion frames, peak and mean rendered speed, the largest snapshot arrival
 gap and the largest gap on the server's own grid in ticks, reconnects, relay
@@ -389,6 +396,39 @@ Three more caveats worth carrying with every number above:
 - **The Upstash database's region is unknown**, and it is a shared database
   rather than one provisioned for this bench. Nothing here separates a slow
   region from a slow provider.
+
+### Attributing the bus tail
+
+`/api/probe?seconds=<n>&key=<SESSION_SECRET>` is the in-function latency probe
+the paragraph above says is worth building, and it exists to answer the one
+question a browser 80ms away cannot: whether the 250 to 433ms band is Redis, or
+everything between Redis and the browser. It opens its own two Redis
+connections from inside a Vercel function (a publisher plus command client, and
+a subscriber on a private `bench:probe:<random>` channel) and, every 100ms for
+`seconds` (bounded 5 to 240), times a PING round trip and a PUBLISH-to-SUBSCRIBE
+round trip. The relay, the browser and the last 80ms of network are all out of
+the path; what is left is exactly the leg from a Vercel function to Redis and
+back.
+
+**It is gated by `key`, and has to be.** The route can run for up to `seconds`
+of function time on purpose, so an unauthenticated GET buying that for free
+would be the same problem the mint limit on `/api/session` exists to prevent,
+aimed at a route whose entire cost is time rather than a Redis write. `key`
+must equal the deployment's `SESSION_SECRET`; anything else, or nothing, is a
+401 before a single Redis connection opens.
+
+```bash
+node bench/probe.mjs --url https://tickroom-bench.vercel.app --key "$SESSION_SECRET" --seconds 60
+```
+
+It prints count, p50, p90, p99 and max for both series, the region the function
+ran in, the Redis host, and every sample over 150ms with its offset from the
+start, and saves the same JSON under `bench/out/`. **Read it next to a
+`run.mjs` client's own gap numbers, not instead of them:** a tail that shows up
+in the probe's own `p99`, `max` or `over150` is the Redis path, measured with
+the browser and the relay both removed. A tail `run.mjs` sees on the same
+deployment that the probe never reproduces belongs to the relay or to the
+client's own socket instead, not to Redis.
 
 ### The input timeline off-by-one, 2026-09-03
 

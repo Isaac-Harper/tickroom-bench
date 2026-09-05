@@ -8,14 +8,15 @@ import { decodeJsonInput } from '@/lib/wire';
 
 /**
  * Same rule as the ticker route: Next only sees these as literal exports of the
- * route module itself, and 300 is the Hobby plan's hard cap. The adapter
+ * route module itself, and 800 is the Pro plan's hard cap (300 was the first
+ * configuration, also the Hobby cap). The adapter
  * derives `lifetimeMs` as `maxDurationS * 1000 - RELAY_EXIT_MARGIN_MS`, so this
  * announces `relay-expiring` at 285 seconds and closes at 290, and the client
  * swaps to a replacement socket in between. Without that the socket would
  * simply be dropped at every cap.
  */
 export const runtime = 'nodejs';
-export const maxDuration = 300;
+export const maxDuration = 800;
 
 /**
  * MODULE SCOPE, so these live as long as this function instance does and every

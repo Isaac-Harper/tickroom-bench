@@ -32,14 +32,24 @@ export default function Page() {
    * render is a hydration mismatch: the server has no `location`, so the two
    * passes would disagree on every one of these values.
    */
-  const [params, setParams] = useState<{ room: string; name: string; bot: boolean } | null>(null);
+  const [params, setParams] = useState<{ room: string; name: string; bot: boolean; leadMs?: number } | null>(null);
 
   useEffect(() => {
     const q = new URLSearchParams(window.location.search);
+    // `?lead=` overrides the connection's input lead, for a sweep of the
+    // default headroom (100, 150, 200) against a real deployment without
+    // rebuilding the library. Absent, out-of-range or non-numeric is left
+    // undefined rather than clamped, so a missing or mistyped value reads as
+    // "no override" instead of silently landing on a boundary nobody asked
+    // for (`Number(null)` is 0, which is why the raw string is checked first).
+    const leadParam = q.get('lead');
+    const leadRaw = leadParam === null ? NaN : Number(leadParam);
+    const leadMs = Number.isFinite(leadRaw) && leadRaw >= 0 && leadRaw <= 1000 ? leadRaw : undefined;
     setParams({
       room: q.get('room') ?? BASE,
       name: q.get('name') ?? 'anon',
       bot: q.get('bot') === '1',
+      leadMs,
     });
   }, []);
 

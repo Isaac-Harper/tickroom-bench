@@ -84,6 +84,9 @@ Options:
   --room <id>        Room instance every client joins. Default "pong".
   --headed           Show the browsers. Default headless.
   --redis <url>      Read the room's stats key and CLIENT LIST from this Redis. Optional.
+  --lead <ms>        Override the connection's input lead (0 to 1000) on every client
+                      via ?lead=, for a sweep of the default headroom (100, 150, 200)
+                      against a real deployment with no library rebuild. Optional.
   --out <dir>        Where the JSON result goes. Default bench/out.
   --help             This.
 
@@ -108,12 +111,16 @@ function parseArgs(argv) {
     else if (a === '--minutes') out.minutes = Number(argv[++i]);
     else if (a === '--room') out.room = argv[++i];
     else if (a === '--redis') out.redis = argv[++i];
+    else if (a === '--lead') out.lead = Number(argv[++i]);
     else if (a === '--out') out.out = resolve(argv[++i]);
     else return { error: `unknown argument: ${a}` };
   }
   if (!out.url) return { error: 'missing --url' };
   if (!Number.isFinite(out.clients) || out.clients < 1) return { error: '--clients must be a positive number' };
   if (!Number.isFinite(out.minutes) || out.minutes <= 0) return { error: '--minutes must be a positive number' };
+  if (out.lead !== undefined && (!Number.isFinite(out.lead) || out.lead < 0 || out.lead > 1000)) {
+    return { error: '--lead must be a number from 0 to 1000' };
+  }
   return out;
 }
 
@@ -175,7 +182,8 @@ async function main() {
   const startedAt = new Date();
   console.error(
     `[bench] ${args.clients} clients, ${args.minutes} min, room ${args.room}, ${args.url}` +
-      (args.redis ? ' (+redis)' : '')
+      (args.redis ? ' (+redis)' : '') +
+      (args.lead !== undefined ? ` (lead ${args.lead}ms)` : '')
   );
 
   // ---- redis sampling, if asked -----------------------------------------
@@ -224,6 +232,7 @@ async function main() {
     target.searchParams.set('bot', '1');
     target.searchParams.set('room', args.room);
     target.searchParams.set('name', rec.name);
+    if (args.lead !== undefined) target.searchParams.set('lead', String(args.lead));
     await page.goto(target.toString(), { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => Boolean(window.__bench), null, { timeout: READY_TIMEOUT_MS });
     // WAITS FOR THE MINT AND NOT JUST FOR THE HOOK. The page publishes
@@ -352,7 +361,14 @@ async function main() {
   const result = {
     startedAt: startedAt.toISOString(),
     endedAt: new Date().toISOString(),
-    args: { url: args.url, clients: args.clients, minutes: args.minutes, room: args.room, redis: Boolean(args.redis) },
+    args: {
+      url: args.url,
+      clients: args.clients,
+      minutes: args.minutes,
+      room: args.room,
+      redis: Boolean(args.redis),
+      lead: args.lead ?? null,
+    },
     clients: perClient,
     room: args.redis
       ? {
@@ -392,7 +408,9 @@ function renderMarkdown(result, file) {
   lines.push('');
   lines.push(
     `${result.args.clients} client(s), ${result.args.minutes} min, room \`${result.args.room}\`, ` +
-      `\`${result.args.url}\`. Raw JSON: \`${file}\`.`
+      `\`${result.args.url}\`` +
+      (result.args.lead !== null ? `, lead ${result.args.lead}ms` : '') +
+      `. Raw JSON: \`${file}\`.`
   );
   lines.push('');
   lines.push('## What each client rendered');

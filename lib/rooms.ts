@@ -72,12 +72,15 @@ export const PRESENCE_TIMEOUT_MS = 60_000;
  * The platform duration cap, in seconds, and the single number every lifetime
  * in this deployment is derived from.
  *
- * 300 is the HARD cap on Vercel's Hobby plan: a `maxDuration` above it is not
+ * 800 is the HARD cap on Vercel's Pro plan (the team this deploys to is Pro;
+ * the first runs used 300, which is both the Hobby cap and the default, and
+ * the README keeps those numbers as run A to C): a `maxDuration` above it is not
  * merely ignored, the deployment is rejected. Everything downstream follows
  * from it and neither number is a preference:
  *
- *   ticker  maxRunMs  = min(700s, 300s - TICKER_EXIT_MARGIN_MS 30s) = 270s
- *   relay   lifetimeMs = 300s - RELAY_EXIT_MARGIN_MS 10s            = 290s
+ *   ticker  maxRunMs  = min(700s, 800s - TICKER_EXIT_MARGIN_MS 30s) = 700s
+ *   relay   lifetimeMs = 800s - RELAY_EXIT_MARGIN_MS 10s            = 790s
+ *   (at 300s, the first measurements: 270s and 290s)
  *
  * So a room hands off between ticker invocations every 270 seconds and every
  * socket warm-swaps to a fresh relay every 290 seconds. A twelve minute run
@@ -92,7 +95,7 @@ export const PRESENCE_TIMEOUT_MS = 60_000;
  * step means the ticker announces a lifetime that lands after it is already
  * dead.
  */
-export const MAX_DURATION_S = 300;
+export const MAX_DURATION_S = 800;
 
 /**
  * `hasOwnProperty`-grade validation with one legal answer. A bare `raw === BASE`
