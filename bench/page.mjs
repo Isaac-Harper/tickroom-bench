@@ -31,6 +31,20 @@
 export const PID_TIMEOUT_MS = 60_000;
 
 /**
+ * The two expressions the wait is built out of, as SOURCE rather than as
+ * functions.
+ *
+ * Two of the harnesses here do not drive Playwright at all: `bench/discard.mjs`
+ * speaks raw CDP (a page holding a debugger session is a page Chrome will not
+ * discard, so it attaches only for the instant of a read) and
+ * `bench/hidden-safari.mjs` speaks WebDriver to a real Safari. Both need
+ * EXACTLY this readiness rule, and a rule written twice is a rule that will
+ * drift, so it lives here once as text every transport can evaluate.
+ */
+export const HOOK_READY_JS = 'Boolean(window.__bench) && window.__bench.pid() !== ""';
+export const PID_JS = 'window.__bench.pid()';
+
+/**
  * Wait until the page has both published its hook AND minted a session, and
  * return this client's own player id.
  *
@@ -39,10 +53,8 @@ export const PID_TIMEOUT_MS = 60_000;
  * alone is waiting for the wrong event.
  */
 export async function waitForPid(page, timeoutMs = PID_TIMEOUT_MS) {
-  await page.waitForFunction(() => Boolean(window.__bench) && window.__bench.pid() !== '', null, {
-    timeout: timeoutMs,
-  });
-  return page.evaluate(() => window.__bench.pid());
+  await page.waitForFunction(HOOK_READY_JS, null, { timeout: timeoutMs });
+  return page.evaluate(PID_JS);
 }
 
 /**

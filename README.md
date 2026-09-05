@@ -123,11 +123,12 @@ version moved, delete the stale tarball, and `npm install`.
 
 ## Running the harness
 
-Three harnesses, all driving real Chromium through Playwright. A real browser
-rather than a headless Node client because `frame()` is driven by
-`requestAnimationFrame`, and rAF is what a browser throttles, what a hidden tab
-stops entirely, and what a busy tab delays. The frame loop **is** the
-measurement surface.
+Five harnesses, all driving a real browser: three through Playwright, one over
+raw CDP because Playwright's own attachment prevents the thing being measured,
+and one over WebDriver into Safari. A real browser rather than a headless Node
+client because `frame()` is driven by `requestAnimationFrame`, and rAF is what a
+browser throttles, what a hidden tab stops entirely, and what a busy tab delays.
+The frame loop **is** the measurement surface.
 
 ```bash
 # the main run: three clients in one room for twelve minutes
@@ -263,6 +264,95 @@ Smooth reads as near zero still frames and a step near the per-frame travel,
 which is 1.5 units at 90 units per second and 60fps; stepping reads as about
 two thirds still and a step of a whole tick, 4.5 units. The script exits 1
 when either grade fails.
+
+**A fourth script, `bench/discard.mjs`, kills the client's renderer instead of
+hiding it.**
+
+```bash
+node bench/discard.mjs --url https://tickroom-bench.vercel.app [--room pong~8] [--roster-seconds 90]
+```
+
+A hidden tab still has a renderer: its socket is up, snapshots keep arriving,
+and `hidden-tab.mjs` measures a client that only stopped drawing. A **discarded**
+tab has nothing. Chrome kills the renderer outright under memory pressure, the
+tab stays in the strip as a title, and the socket, the connection, the tick
+counter and the player's seat go with it, with no close the page itself
+performed. On return the tab is **reloaded**, so the room sees a new client mint
+a new player id while the old one is still in the roster until the server
+notices. The script records four milestones from the moment the tab is brought
+back (first rendered frame, a minted id, an open socket, being drawn in the
+roster again), the reconnect count on the new connection, which must be 0
+because a reload is not a reconnect, and how long the discarded client's seat
+took to leave the room. It defaults to room `pong~8` rather than `pong` on
+purpose: a discard leaves a dead player behind for as long as the reap takes,
+which would show up in anything else measuring the same room.
+
+**The discard mechanism, and the two things that stop it.** There is no CDP
+command for discarding a tab, so the harness drives Chrome's own page: it opens
+a second tab, presses the **Enable internal debugging pages** button on
+`chrome://chrome-urls` (Chrome gates `chrome://discards` behind that switch now,
+per profile, and the profile is thrown away every run), then clicks
+**[Urgent Discard]** on the client's row of `chrome://discards`. Urgent is the
+memory-pressure path rather than the proactive one Chrome runs on its own
+schedule. The row's own lifecycle state, `discarded (urgent)` with a timestamp,
+is the confirmation, and it has to be, because the obvious check is destructive:
+attaching to a discarded tab is enough to make Chrome reload it.
+**A tab with a debugger session attached is not discardable at all**, which
+rules Playwright out of this script entirely: `connectOverCDP` attaches to every
+page in the browser's default context and holds it, and with that session open
+the click lands, the page reports success and `Discard Count` stays 0. So
+`discard.mjs` speaks raw CDP over Node's own `WebSocket` and attaches to the
+client tab only for the instant of each read. Two differences between builds are worth
+knowing, and both are handled rather than assumed. Chrome 152 destroys the page
+target along with the renderer and makes a new one for the same tab, where
+Chrome for Testing 151 kept the id, so everything after the discard asks the
+browser which target is showing the client URL rather than remembering one. And
+Chrome for Testing 151 reloads the tab as soon as it is activated, where Chrome
+152 accepts the activation and leaves the tab dead until it is really shown,
+which never happens if that window is not the frontmost thing on the machine; so
+after a five second grace period the harness sends the reload itself, reports
+which of the two brought the tab back, and keeps the evidence either way
+(`document.wasDiscarded` is still true after a reload, where a fresh navigation
+to the same URL would clear it). The script exits 3, naming what it tried, if
+the discard cannot be triggered.
+
+**A fifth, `bench/hidden-safari.mjs`, is the hidden-tab measurement on real
+Safari.**
+
+```bash
+node bench/hidden-safari.mjs --url https://tickroom-bench.vercel.app --minutes 6.5 [--room pong~9]
+```
+
+Every number `hidden-tab.mjs` produces is about Chromium's throttling policy:
+when rAF stops, how hard timers are clamped, how often a hidden tab is still
+allowed to send. Safari's policy is different software, and the library's
+liveness defaults are sized against whichever browser is stingiest, so this run
+is the other half of that claim. **Playwright's WebKit is not Safari**, so this
+one drives the actual Safari.app through `safaridriver` over the raw WebDriver
+protocol, `fetch` against `http://127.0.0.1:<port>`, with no new dependency. It
+starts its own `safaridriver` (or adopts one already listening on `--port`),
+opens the client, waits for the mint with the same readiness rule the Playwright
+harnesses use out of `bench/page.mjs`, samples every 30s exactly as the Chrome
+run does, closes the front tab at the end, and watches the recovery for 20s at
+1s. It prints the same table plus the browser's own `navigator.userAgent`.
+
+**The one-tab-visibility caveat, which is the whole trick.** WebDriver has a
+current window handle, `execute/sync` runs there, and it is not the same thing
+as the tab the browser is showing: `POST /window/new` opens a tab in front in
+Safari and, per the specification, does not move the current handle. So the
+harness keeps its handle on the client while Safari shows the new empty tab, and
+the client is genuinely backgrounded while still answering scripts. **Switching
+to it with `POST /window` would raise it** and end the state being measured, so
+nothing does that until the recovery phase. That is verified on the spot rather
+than assumed: if `document.hidden` does not read true from the client's context,
+the run falls back to switching to it for each sample and switching back, says
+so in the log and in its own summary, and the numbers then carry a moment of
+visibility every 30 seconds. A run where the tab never reads hidden measured
+nothing and exits 3. Safari needs **Allow remote automation** on (Safari
+Settings, Developer) and, on macOS 26, that is a setting the running Safari
+reads at launch: turn it on, then quit and reopen Safari. `sudo safaridriver
+--enable` is the other half on a machine that has never run a WebDriver session,
+and it asks for an administrator password.
 
 ## Results
 
@@ -699,9 +789,12 @@ sim/
 bench/
   run.mjs                   N clients, M minutes, JSON plus a markdown summary
   hidden-tab.mjs            one client backgrounded, then brought back
+  hidden-safari.mjs         the same, in real Safari over WebDriver
+  discard.mjs               one client's renderer killed, then the tab brought back
   paddle.mjs                one client, a held key: reconciliation and motion regularity
   analyse.mjs               the library's own smoothness analysis, ported
-  page.mjs                  what both harnesses need from a page, once
+  page.mjs                  what every harness needs from a page, once
+  chrome.mjs                starting, attaching to and quitting a real browser process
 vendor/
   tickroom-0.2.0.tgz        the dependency itself
 ```

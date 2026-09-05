@@ -53,13 +53,16 @@
 //    A hidden true, visibilityState hidden, and ZERO rAF callbacks in five
 //    seconds, against 187 in the same five seconds without `noDefaults`.
 
-import { execFileSync, spawn } from 'node:child_process';
-import { access, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { chromium } from 'playwright';
 
+// The real-browser half lives in `bench/chrome.mjs`, because `bench/discard.mjs`
+// needs the identical process, profile and attach. Only the Playwright-launched
+// fallback below is still this file's own.
+import { CDP_PORT, connectToBrowser, hideBehind, launchBrowser, quitBrowser, resolveBrowserApp } from './chrome.mjs';
 import { seated, waitForPid } from './page.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -78,15 +81,6 @@ const READY_TIMEOUT_MS = 60_000;
 /** Let the client settle and prove it works BEFORE hiding it. A run that backgrounded a tab which had never connected would report a client that never came back and blame the wrong thing. */
 const SETTLE_MS = 15_000;
 
-/** How long a visibility change is given to reach the renderer before it is read back. */
-const VISIBILITY_SETTLE_MS = 1500;
-
-/** The debugging port `--chrome` starts its own browser on. Not 9222, which is the one a human's Chrome is most likely already holding. */
-const CDP_PORT = 9333;
-
-/** How long that browser gets to answer `/json/version`. Covers a cold app start and a fresh profile. */
-const CDP_READY_TIMEOUT_MS = 30_000;
-
 /**
  * The three flags Playwright passes by default that would make this run
  * meaningless. Removed rather than overridden: `ignoreDefaultArgs` takes the
@@ -98,12 +92,6 @@ const BACKGROUNDING_FLAGS = [
   '--disable-background-timer-throttling',
   '--disable-backgrounding-occluded-windows',
   '--disable-renderer-backgrounding',
-];
-
-/** Where a real Google Chrome lives on macOS, in the order worth trying. */
-const CHROME_APPS = [
-  '/Applications/Google Chrome.app',
-  join(process.env.HOME ?? '', 'Applications', 'Google Chrome.app'),
 ];
 
 const USAGE = `
@@ -208,166 +196,6 @@ async function sampleWith(page, pid) {
   return { ...s, inRoster: seated(s.entities, pid) };
 }
 
-// ---- the real browser ----------------------------------------------------
-
-/**
- * The app bundle to start for `--chrome`.
- *
- * A real Google Chrome if there is one, because the point of the mode is to
- * measure the browser people use. Playwright's own build otherwise: it is
- * Chromium at the same milestone with the same visibility and backgrounding
- * code, it is already on disk next to this harness, and driving it as a browser
- * PROCESS rather than through `chromium.launch` is what the mode is really
- * about. The fallback is announced, because "Chrome" in the output would
- * otherwise be a claim nobody checked.
- */
-async function resolveBrowserApp() {
-  for (const app of CHROME_APPS) {
-    try {
-      await access(app);
-      return { app, real: true };
-    } catch {
-      // Not installed here; try the next.
-    }
-  }
-  const exe = chromium.executablePath();
-  const app = exe.replace(/\/Contents\/MacOS\/[^/]+$/, '');
-  if (app === exe) return null;
-  return { app, real: false };
-}
-
-/** Every process holding the throwaway profile. That path exists only for this run, so a match is ours by construction and the user's own windows can never be one. */
-function profilePids(profileDir) {
-  try {
-    const out = execFileSync('/usr/bin/pgrep', ['-f', `user-data-dir=${profileDir}`], { encoding: 'utf8' });
-    return out
-      .split('\n')
-      .map((l) => Number(l.trim()))
-      .filter((n) => Number.isInteger(n) && n > 0 && n !== process.pid);
-  } catch {
-    // pgrep exits 1 when nothing matched, which is the ordinary answer here.
-    return [];
-  }
-}
-
-/**
- * Start a browser of our own and wait for it to answer CDP.
- *
- * `open -na` and not a bare spawn of the binary: `-n` is what makes this a
- * SECOND instance rather than a message to an already running one, and `-a`
- * launches it the way the window server expects so it has a real window with a
- * real frontmost tab. The throwaway `--user-data-dir` is the other half of the
- * isolation and the thing every kill below is keyed on.
- */
-async function launchBrowser(app, profileDir, port) {
-  // THROWN AWAY EVERY RUN, not just named that. A kept profile makes the second
-  // run of the day a different experiment from the first: Chrome restores the
-  // previous session's tabs, so `contexts()[0].pages()[0]` is one of THOSE
-  // rather than the fresh `about:blank` this mode is written against, and the
-  // client never mints. Measured twice in a row: run one on a fresh profile
-  // seated in 15 seconds, runs two and three on the kept profile timed out
-  // waiting for a player id that was never going to arrive. The path is a fixed
-  // subdirectory of `--out`, so this can only ever remove the one this harness
-  // created.
-  await rm(profileDir, { recursive: true, force: true });
-  await mkdir(profileDir, { recursive: true });
-  spawn(
-    'open',
-    [
-      '-na',
-      app,
-      '--args',
-      `--remote-debugging-port=${port}`,
-      `--user-data-dir=${profileDir}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      'about:blank',
-    ],
-    { stdio: 'ignore' }
-  ).unref();
-
-  const deadline = Date.now() + CDP_READY_TIMEOUT_MS;
-  for (;;) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/json/version`);
-      if (res.ok) return await res.json();
-    } catch {
-      // Not listening yet.
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`browser did not answer CDP on 127.0.0.1:${port} within ${CDP_READY_TIMEOUT_MS}ms`);
-    }
-    await sleep(250);
-  }
-}
-
-/**
- * Quit the browser this run started, and only that one.
- *
- * `browser.close()` is NOT enough: Playwright documents it as closing a browser
- * it launched and merely DISCONNECTING from one it attached to, so on its own
- * it would leave a Chrome running with a throwaway profile forever. `Browser.close`
- * over a browser-level CDP session is the real quit. The pgrep sweep afterwards
- * is the belt, keyed on the profile path so it cannot reach anything else.
- */
-async function quitBrowser(browser, profileDir) {
-  try {
-    const session = await browser.newBrowserCDPSession();
-    await session.send('Browser.close');
-  } catch {
-    // A browser that already went away answers nothing, which is the goal.
-  }
-  try {
-    await browser.close();
-  } catch {
-    // Closing the connection to a process that just quit throws; it is done.
-  }
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    if (profilePids(profileDir).length === 0) return true;
-    await sleep(250);
-  }
-  for (const pid of profilePids(profileDir)) {
-    try {
-      process.kill(pid, 'SIGTERM');
-    } catch {
-      // Gone between the listing and the signal.
-    }
-  }
-  await sleep(1000);
-  return profilePids(profileDir).length === 0;
-}
-
-/**
- * Put page B in front and PROVE page A went hidden.
- *
- * The proof is the whole point. Without it a misconfigured browser spends the
- * next six and a half minutes measuring a foreground tab and reports it as a
- * background one, which is worse than measuring nothing because the numbers
- * look fine. `Page.bringToFront` is the ordinary request; `Target.activateTarget`
- * on the browser session is the same request one layer down, tried second
- * because there are window arrangements where the first is answered without the
- * tab activation actually happening.
- */
-async function hideBehind(browser, context, pageA, pageB) {
-  await pageB.bringToFront();
-  await sleep(VISIBILITY_SETTLE_MS);
-  if (await pageA.evaluate(() => document.hidden)) return { hidden: true, via: 'bringToFront' };
-
-  try {
-    const pageSession = await context.newCDPSession(pageB);
-    const { targetInfo } = await pageSession.send('Target.getTargetInfo');
-    const browserSession = await browser.newBrowserCDPSession();
-    await browserSession.send('Target.activateTarget', { targetId: targetInfo.targetId });
-    await pageSession.detach();
-  } catch (err) {
-    return { hidden: false, via: null, error: String(err && err.message ? err.message : err) };
-  }
-  await sleep(VISIBILITY_SETTLE_MS);
-  if (await pageA.evaluate(() => document.hidden)) return { hidden: true, via: 'Target.activateTarget' };
-  return { hidden: false, via: null };
-}
-
 const NOT_HIDDEN_MESSAGE = [
   'document.hidden is still false after bringing the second tab to the front.',
   'Nothing about a backgrounded tab can be measured from here: the render loop is',
@@ -419,9 +247,8 @@ async function main() {
     // without it every page Playwright attaches to is told to simulate a focused
     // and active document, and `document.hidden` can never turn true. It applies
     // only to the browser's OWN default context, which is why the pages below
-    // come out of `browser.contexts()[0]` rather than a fresh one.
-    browser = await chromium.connectOverCDP(`http://127.0.0.1:${args.port}`, { noDefaults: true });
-    context = browser.contexts()[0];
+    // come out of the browser's own context rather than a fresh one.
+    ({ browser, context } = await connectToBrowser(args.port));
     if (!context) {
       console.error('[hidden] the browser reported no default context to attach to');
       await quitBrowser(browser, profileDir);
