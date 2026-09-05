@@ -23,9 +23,18 @@
 //    library's harness owns the connection and can stamp every `onSnapshot`;
 //    here the page reports the newest `serverTime` and `inst` it has seen on
 //    each rendered frame, so a snapshot's arrival is known to within one frame
-//    (about 16ms at 60fps). Every snapshot-gap figure below therefore carries
+//    (about 16ms at 60fps). Every `snapshotGap` figure below therefore carries
 //    that much quantisation, which matters for the 150ms bar and not at all for
 //    the multi-second gaps a handoff or a reconnect would produce.
+//
+//    IT ALSO CANNOT TELL A HOLE IN THE SOCKET FROM A LOOP THAT STOPPED
+//    LOOKING, which is why `socketGap` exists beside it. The page now also
+//    keeps a ring of `performance.now()` taken in the socket's own `message`
+//    handler (`window.__bench.arrivals()`, see `BenchSocket` in
+//    `game/pong.ts`), a series that owes nothing to `requestAnimationFrame`.
+//    The two agreeing puts a gap on the socket path or upstream of it; the
+//    frames alone seeing it puts it in the client's own event loop. That
+//    attribution is attached to each wide gap as `confirmedBySocket`.
 //
 // 2. THE SERVER-SIDE COUNTERS COME FROM REDIS, not from the ticker's own
 //    `onStats` hook, because the ticker is a function on somebody else's
@@ -63,6 +72,31 @@ export const GAP_REPORT_MS = 250;
 /** How far either side of a gap an event is still a candidate explanation. Two seconds covers a warm swap's whole attempt-and-adopt sequence and a reconnect's first ladder step. */
 const GAP_CONTEXT_MS = 2000;
 
+/**
+ * How wide a SOCKET gap has to be to confirm a frame-inferred one, ms.
+ *
+ * Lower than the 250ms the frame series reports at, on purpose. The two series
+ * do not measure the same interval: the frame-inferred gap runs from one
+ * RENDERED observation to the next and so carries up to a frame of quantisation
+ * at each end, and a render loop recovering from its own hiccup can draw the
+ * first post-gap frame late. So a 260ms hole in the arrivals can present as a
+ * 250ms one to the frames, or the other way round, and a bar set equal to the
+ * report bar would turn that rounding into a "render" verdict. 200 is the same
+ * hole seen through a looser instrument, and still far above the 50ms tick.
+ */
+export const SOCKET_CONFIRM_MS = 200;
+
+/**
+ * How far apart the two series' timestamps may sit and still be one hole, ms.
+ *
+ * Both are stamped at the END of the gap (the frame that first showed the new
+ * `serverTime`, and the arrival that ended the socket's silence), so a match
+ * should be near-exact and the slack is for the render loop's own recovery
+ * delay. Wide enough to survive several dropped frames, narrow enough that it
+ * cannot reach the next snapshot gap in a run whose gaps are seconds apart.
+ */
+export const SOCKET_MATCH_MS = 300;
+
 /** The event kinds that can explain a hole in the snapshot stream. A roster frame or a mint error cannot, and listing those would bury the ones that can. */
 const GAP_CONTEXT_KINDS = new Set(['status', 'close', 'swap', 'handoff', 'reanchor', 'stall', 'terminal']);
 
@@ -79,8 +113,11 @@ function percentile(sorted, p) {
  * `statsSeries` the `stats()` object from each 500ms poll, and `endStats` the
  * last of those. `t0` is the `performance.now()` of the first frame, so every
  * `atMs` below is relative to the client's own clock and not to the harness's.
+ * `arrivals` is every `window.__bench.arrivals()` timestamp in order, on that
+ * same clock; a harness that does not drain it passes nothing and gets a
+ * `socketGap` that says so rather than one that reads as a silent socket.
  */
-export function analyse(frames, events, statsSeries, endStats, t0, steadyLeadMs = STEADY_LEAD_MS) {
+export function analyse(frames, events, statsSeries, endStats, t0, arrivals = [], steadyLeadMs = STEADY_LEAD_MS) {
   // The first frame that had a snapshot in its epoch is the earliest moment
   // anything below is meaningful.
   const firstSnapFrame = frames.find((f) => f.epochSnaps > 0);
@@ -194,6 +231,29 @@ export function analyse(frames, events, statsSeries, endStats, t0, steadyLeadMs 
     prevInst = f.inst;
   }
 
+  // THE SAME ARRIVALS, MEASURED AT THE SOCKET. No inference and no rAF: each of
+  // these is a `performance.now()` taken as the first statement of the message
+  // handler, before the library decoded anything. The cadence figures (median,
+  // p99) are the socket's own health and should sit on the tick period; the
+  // wide ones are what the frame-inferred gaps above are checked against.
+  let socketMax = 0;
+  let socketOver150 = 0;
+  const socketGaps = [];
+  const socketWide = [];
+  for (let i = 1; i < arrivals.length; i++) {
+    const g = arrivals[i] - arrivals[i - 1];
+    if (!(g >= 0)) continue;
+    socketGaps.push(g);
+    if (g > socketMax) socketMax = g;
+    if (g > 150) socketOver150 += 1;
+    // Stamped at the END of the gap, like the frame-inferred ones, so the two
+    // can be compared without an offset.
+    if (g >= SOCKET_CONFIRM_MS) socketWide.push({ atMs: +(arrivals[i] - t0).toFixed(1), gapMs: +g.toFixed(1) });
+  }
+  const sortedSocketGaps = [...socketGaps].sort((a, b) => a - b);
+  const socketMedian = percentile(sortedSocketGaps, 50);
+  const socketP99 = percentile(sortedSocketGaps, 99);
+
   // Tick deviation from the tick the client WANTS to be stamping. A frame taken
   // while unanchored has no meaningful answer, so it is skipped rather than
   // counted as a huge deviation.
@@ -217,6 +277,30 @@ export function analyse(frames, events, statsSeries, endStats, t0, steadyLeadMs 
     g.near = contextEvents
       .filter((e) => Math.abs(e.atMs - g.atMs) <= GAP_CONTEXT_MS)
       .map((e) => ({ ...e, dtMs: +(e.atMs - g.atMs).toFixed(1) }));
+    // WHICH SERIES SAW THE HOLE, which is the question the whole socket ring
+    // exists to answer. A frame gap with a socket gap beside it is a hole in
+    // the arrivals themselves (the socket path, or anything upstream of it);
+    // a frame gap the socket never saw is the client's own event loop, which
+    // kept receiving and stopped drawing.
+    //
+    // `null` RATHER THAN `false` WHEN THERE IS NOTHING TO ANSWER WITH. A page
+    // built before the ring existed, or a harness that never drained it,
+    // reports no arrivals at all, and calling that "the socket was fine" would
+    // attribute every gap in the run to a render loop on no evidence. Same
+    // reasoning as `countSubscribers` in `bench/run.mjs`: the honest answer to
+    // an instrument that did not report is not zero.
+    if (arrivals.length < 2) {
+      g.confirmedBySocket = null;
+      g.socketGapMs = null;
+      continue;
+    }
+    let hit = null;
+    for (const w of socketWide) {
+      if (Math.abs(w.atMs - g.atMs) > SOCKET_MATCH_MS) continue;
+      if (hit === null || w.gapMs > hit.gapMs) hit = w;
+    }
+    g.confirmedBySocket = hit !== null;
+    g.socketGapMs = hit === null ? null : hit.gapMs;
   }
 
   const reanchors = events
@@ -277,6 +361,20 @@ export function analyse(frames, events, statsSeries, endStats, t0, steadyLeadMs 
       maxServerMs: +maxServerGapMs.toFixed(1),
       maxServerTicks: +(maxServerGapMs / TICK_MS).toFixed(2),
       handoffs,
+    },
+    /**
+     * The same stream measured at the socket instead of at the render loop.
+     * `arrivals` of 0 means the page reported none (no socket, or a harness
+     * that does not drain the ring), and every figure below is then empty
+     * rather than healthy.
+     */
+    socketGap: {
+      arrivals: arrivals.length,
+      maxMs: +socketMax.toFixed(1),
+      medianMs: socketMedian === null ? null : +socketMedian.toFixed(1),
+      p99Ms: socketP99 === null ? null : +socketP99.toFixed(1),
+      over150: socketOver150,
+      over250: socketWide.filter((w) => w.gapMs >= GAP_REPORT_MS),
     },
     tick: { maxDev: +maxDev.toFixed(2), reanchors, maxAbsReanchor: reanchors.reduce((m, r) => Math.max(m, Math.abs(r.delta)), 0) },
     client: {

@@ -1,6 +1,6 @@
 // The measurement surface the page hands to the harness, and nothing else.
 //
-// `bench/run.mjs` drives a real browser and reads these three functions out of
+// `bench/run.mjs` drives a real browser and reads these functions out of
 // `window` every 500ms. Everything about the shape below exists to make the
 // SAME analysis the library already runs on loopback
 // (`tests/helpers/smoothness.ts`, `FrameRec` and `analyse()`) run unchanged on
@@ -99,6 +99,27 @@ export interface BenchApi {
   frames(): BenchFrame[];
   /** Every event since the last call, oldest first, and clears the buffer. */
   events(): BenchEvent[];
+  /**
+   * `performance.now()` for every SNAPSHOT the socket delivered since the last
+   * call, oldest first, and clears the buffer.
+   *
+   * THE ONE MEASUREMENT IN THIS FILE THAT DOES NOT COME OFF THE RENDER LOOP,
+   * and the whole reason it exists. Every arrival figure `bench/analyse.mjs`
+   * reports is INFERRED from frames: a frame whose `serverTime` moved is the
+   * first frame after a snapshot landed. That inference cannot tell a hole in
+   * the socket path from a render loop that stopped looking, and by 2026-09-05
+   * those were the last two candidates left for the 250 to 433ms arrival tail
+   * (`/api/probe` cleared the Redis leg, and the relay's own `relay.gaps`
+   * cleared everything up to its `send` returning). A timestamp taken in the
+   * socket's `message` handler is independent of `requestAnimationFrame`, so
+   * the two series disagree exactly when the client's own loop is the cause.
+   *
+   * Plain numbers on the same `performance.now()` clock as `BenchFrame.t`,
+   * which is what lets a gap in one be lined up with a gap in the other. See
+   * `BenchSocket` in `game/pong.ts` for where they are taken and why text
+   * frames are not among them.
+   */
+  arrivals(): number[];
   /** This client's own player id, or '' before the first mint returned. */
   pid(): string;
 }
@@ -109,7 +130,7 @@ declare global {
   }
 }
 
-/** The working window: 4000 records is roughly a minute of 60fps frames, far past the 500ms the harness actually polls at. */
+/** The working window: 4000 records is roughly a minute of 60fps frames (or three minutes of 20Hz snapshot arrivals), far past the 500ms the harness actually polls at. */
 const CAP = 4000;
 
 /**

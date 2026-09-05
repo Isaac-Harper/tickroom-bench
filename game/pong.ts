@@ -107,6 +107,19 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
 
   const frameBuf = new RingBuffer<BenchFrame>();
   const eventBuf = new RingBuffer<BenchEvent>();
+  /**
+   * Snapshot arrivals as the SOCKET saw them, not as the render loop inferred
+   * them. See `arrivals()` in `game/bench.ts` for why the distinction is the
+   * last one the arrival tail needed, and `BenchSocket` below for where the
+   * timestamp is taken.
+   *
+   * BOTH SOCKETS OF A WARM SWAP PUSH INTO THIS ONE RING, because nothing
+   * outside the connection can say which of the two it currently considers
+   * live. So a swap contributes the replacement's own first frames to the
+   * series, which is honest (they arrived) and is placed in time by the `swap`
+   * event sitting beside them.
+   */
+  const arrivalBuf = new RingBuffer<number>();
   /** `performance.now()` at start, so every `t` in a run is relative to the same origin as the harness's own samples. */
   const record = (kind: BenchEvent['kind'], detail: Record<string, unknown>): void => {
     eventBuf.push({ t: performance.now(), kind, detail });
@@ -176,13 +189,15 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
    *
    * `WebSocketImpl` is documented for supplying a non-DOM implementation, and
    * the connection builds every socket through it including the warm swap's
-   * replacement, so a subclass sees every frame sent and every close. That is
-   * the only way this page can report either: the library consumes `ping`,
-   * `pong` and `relay-expiring` internally as transport bookkeeping, and it
-   * turns a close into a status change and a reconnect with the CODE dropped.
-   * A run that reconnected once and cannot say whether that was 1006, a 1001
-   * from a function exiting, or a policy close has measured that something
-   * happened and nothing about what.
+   * replacement, so a subclass sees every frame sent, every frame received and
+   * every close. That is the only way this page can report any of the three:
+   * the library consumes `ping`, `pong` and `relay-expiring` internally as
+   * transport bookkeeping, it turns a close into a status change and a
+   * reconnect with the CODE dropped, and it hands a snapshot to `onSnapshot`
+   * only after decoding it on a render loop that may not be running. A run
+   * that reconnected once and cannot say whether that was 1006, a 1001 from a
+   * function exiting, or a policy close has measured that something happened
+   * and nothing about what.
    *
    * The ping match is on the library's own `PING_FRAME_PREFIX` rather than a
    * string retyped here, because a prefix that drifted would silently count
@@ -191,6 +206,26 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
   class BenchSocket extends WebSocket {
     constructor(url: string) {
       super(url);
+      // ARRIVAL TIME, TAKEN BEFORE THE LIBRARY EVER SEES THE MESSAGE. The
+      // connection attaches its reader by assigning `socket.onmessage` after
+      // `new WebSocketImpl(url)` has returned, and a property handler takes its
+      // place in the listener order from the moment it is first assigned, so a
+      // listener registered here in the constructor cannot help but run first.
+      // The timestamp is the first statement of the handler for the same
+      // reason: anything above it would be charged to the arrival.
+      //
+      // TEXT FRAMES ARE DELIBERATELY NOT RECORDED, and that is not a
+      // simplification. The library's own transport frames share this socket:
+      // a `pong` every 2000ms, `relay-expiring`, the roster seed. A pong
+      // landing inside a 400ms snapshot hole would split it into two 200ms
+      // gaps and report a healthy socket, which is the exact wrong answer for
+      // the one question this ring exists to settle. Snapshots are the binary
+      // frames (`binaryType` is `arraybuffer`), so the test is the same one the
+      // library's own `handleMessage` splits on.
+      this.addEventListener('message', (ev) => {
+        const at = performance.now();
+        if (typeof ev.data !== 'string') arrivalBuf.push(at);
+      });
       this.addEventListener('close', (ev) => {
         record('close', { code: ev.code, reason: ev.reason, wasClean: ev.wasClean });
       });
@@ -583,6 +618,7 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       rosterSize,
       framesDropped: frameBuf.dropped,
       eventsDropped: eventBuf.dropped,
+      arrivalsDropped: arrivalBuf.dropped,
       // See `BenchSocket`: the count of round-trip probes that reached the wire,
       // which is what a throttled hidden tab stops producing.
       pingsSent,
@@ -598,6 +634,7 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
     }),
     frames: () => frameBuf.drain(),
     events: () => eventBuf.drain(),
+    arrivals: () => arrivalBuf.drain(),
     pid: () => selfPid,
   };
   window.__bench = api;

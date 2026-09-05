@@ -160,11 +160,15 @@ deployment without rebuilding the library each time.
 
 **Per client**, `run.mjs` reports frames, backward steps, blank frames,
 zero-motion frames, peak and mean rendered speed, the largest snapshot arrival
-gap and the largest gap on the server's own grid in ticks, reconnects, relay
-swaps (completed, attempted and failed), tick re-anchors with their largest
-delta, stalls, terminals, and the round trip. It also lists every ticker handoff
-the client saw and every resume step across an epoch boundary, which are the two
-events the whole exercise is about.
+gap and the largest gap on the server's own grid in ticks, the socket's own
+arrival cadence (max, median and p99 gap, taken in the `message` handler rather
+than inferred from frames), reconnects, relay swaps (completed, attempted and
+failed), tick re-anchors with their largest delta, stalls, terminals, and the
+round trip. It also lists every ticker handoff the client saw and every resume
+step across an epoch boundary, which are the two events the whole exercise is
+about, and marks every arrival gap over 250ms `socket` or `render` according to
+whether the socket saw it too. See "Attributing the bus tail" for how to read
+that pair.
 
 **With `--redis`**, it also reports what the room itself said: starves, late
 inputs, refused inputs, host errors, skipped publishes, bytes published and
@@ -667,16 +671,77 @@ network) or the client's own event loop. The room's counters for the run:
 `starves` 71, `lateInputs` 67 over about 12,000 ticks, tick rate 19.96 to
 20.95Hz.
 
-**The caveat is the client, and it is the same caveat run D carries.** This run
-rendered inside a Docker container on a loaded box, and every arrival time this
-bench quotes is inferred from **frames**, so a container render stall reads as
-an arrival gap. The Mac runs saw the same 250 to 433ms band at a lower rate,
-which is what makes the band real and this run's rate the wrong number to
-quote. **Still owed:** a client-side probe that timestamps socket `message`
-events independently of the render loop, a ring of `onmessage` timestamps in
-the bench page, which is what separates the socket path from the client's own
-loop. Until that exists, "downstream of the relay" is as far as this
-attribution goes.
+**The caveat was the client, and it is the same caveat run D carries.** That
+run rendered inside a Docker container on a loaded box, and every arrival time
+this bench quoted was inferred from **frames**, so a container render stall
+read as an arrival gap. The Mac runs saw the same 250 to 433ms band at a lower
+rate, which is what makes the band real and that run's rate the wrong number to
+quote. Removing the caveat needed a client-side arrival time that owes nothing
+to the render loop, and that is the instrument below.
+
+**The socket ring: `window.__bench.arrivals()`.** `BenchSocket` in
+`game/pong.ts` registers a `message` listener in its own constructor, and the
+connection cannot get ahead of it: the library attaches its reader by assigning
+`socket.onmessage` after `new WebSocketImpl(url)` has returned, and a property
+handler takes its place in the listener order from the moment it is first
+assigned, so a listener registered inside the constructor always runs first.
+`performance.now()` is the first statement of that handler, so what is recorded
+is the arrival rather than the arrival plus a decode. It is a 4000-entry ring
+(about three minutes of 20Hz snapshots) drained on the same 500ms poll as the
+frames, on the same clock as `BenchFrame.t`, and `stats().arrivalsDropped` says
+whether the harness ever fell behind it.
+
+**Only binary frames go in, and that is not a simplification.** The library's
+own transport frames share the socket: a `pong` every 2000ms, `relay-expiring`,
+the roster seed. A pong landing inside a 400ms snapshot hole would split it
+into two 200ms gaps and report a healthy socket, which is the exact wrong
+answer to the one question the ring exists to settle. Snapshots are the binary
+frames (`binaryType` is `arraybuffer`), which is the same test the library's own
+`handleMessage` splits on.
+
+**The new column: `socket gap max/med/p99`.** It sits next to `max snap gap` in
+the per-client table and is the same stream measured the other way. Read the
+two together:
+
+| what the table shows | what it means |
+| --- | --- |
+| socket median on the 50ms tick, socket max near the snap gap | the hole is real and is in the socket path or upstream of it |
+| socket median on the tick, socket max well under the snap gap | the arrivals kept coming and the render loop is what paused |
+| `none` | the page reported no arrivals at all, so nothing here is attributed |
+
+`none` is what a local run prints, because `/api/ws` needs the Vercel runtime
+and no socket ever opens, and it is also what a deployment older than the ring
+prints. It is deliberately not three zeros: a silent socket and an absent
+instrument are the two things that must never read the same.
+
+**And per gap, `socket` or `render`.** Every arrival gap over 250ms already got
+its own line with the events around it; each of those lines now ends in a
+verdict, and `snapshotGap.over150[].confirmedBySocket` carries the same thing in
+the JSON alongside the matched `socketGapMs`:
+
+```
+- at 128.4s, 433ms, epoch 0, socket, socket gap 420.1ms, near: swap 3/3/0 +0.4s
+- at 401.7s, 267ms, epoch 0, render, socket saw none, nothing within 2s
+```
+
+`socket` means the socket's own handler saw the same hole, so the cause is the
+socket path or anything upstream of it. `render` means the arrivals kept coming
+and only the frames stopped, so the cause is that client's event loop, which is
+precisely the container caveat above made measurable instead of asserted. A
+socket gap of at least **200ms** within **300ms** of the frame gap is what
+confirms one; the bar is below the 250ms report bar on purpose, because the
+frame-inferred gap carries up to a frame of quantisation at each end and an
+equal bar would turn that rounding into a false `render`. A run with no
+arrivals at all reports `unattributed` rather than `render`, for the same
+reason `none` is not zero.
+
+**One thing it still cannot separate, and the report does not pretend
+otherwise.** A blocked event loop stops the `message` handler too, so a client
+that froze its whole main thread gaps in both series and reads as `socket`.
+What the ring cleanly rules out is the case that actually threatened run D's
+reading: a render loop starved while the socket kept delivering. So `socket`
+means "not only the render loop", and the wording in the report says the socket
+path **or upstream**, never "the network".
 
 ### The input timeline off-by-one, 2026-09-03
 

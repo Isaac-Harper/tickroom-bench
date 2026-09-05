@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url';
 
 import { chromium } from 'playwright';
 
-import { analyse, summariseRoomStats, GAP_REPORT_MS, TICK_MS } from './analyse.mjs';
+import { analyse, summariseRoomStats, GAP_REPORT_MS, SOCKET_CONFIRM_MS, SOCKET_MATCH_MS, TICK_MS } from './analyse.mjs';
 import { waitForPid } from './page.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -129,12 +129,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /**
  * The drain, and it is deliberately ONE round trip per client per poll.
  *
- * Each of `frames()` and `events()` empties what it returns, so a failed or
- * partial evaluate loses records rather than repeating them. Reading all four
- * in one expression means a page that navigated, crashed or was closed mid-poll
- * loses one poll's worth and nothing else, and the `catch` records that it
- * happened instead of ending the run: a bench that aborts on the first blip
- * cannot measure a deployment whose whole point is surviving blips.
+ * Each of `frames()`, `events()` and `arrivals()` empties what it returns, so a
+ * failed or partial evaluate loses records rather than repeating them. Reading
+ * all of them in one expression means a page that navigated, crashed or was
+ * closed mid-poll loses one poll's worth and nothing else, and the `catch`
+ * records that it happened instead of ending the run: a bench that aborts on
+ * the first blip cannot measure a deployment whose whole point is surviving
+ * blips.
  */
 /**
  * How many of those connections are in subscribe mode, WHEN THE SERVER SAYS.
@@ -163,7 +164,18 @@ async function drain(page) {
   return page.evaluate(() => {
     const b = window.__bench;
     if (!b) return null;
-    return { status: b.status(), stats: b.stats(), frames: b.frames(), events: b.events(), pid: b.pid() };
+    return {
+      status: b.status(),
+      stats: b.stats(),
+      frames: b.frames(),
+      events: b.events(),
+      // FEATURE-DETECTED, because this harness is routinely pointed at a
+      // deployment older than itself. A page without the socket ring answers
+      // nothing here and `analyse()` reports the attribution as unavailable
+      // rather than as "the socket was fine".
+      arrivals: b.arrivals ? b.arrivals() : [],
+      pid: b.pid(),
+    };
   });
 }
 
@@ -216,6 +228,7 @@ async function main() {
       pid: '',
       frames: [],
       events: [],
+      arrivals: [],
       statsSeries: [],
       statuses: [],
       pageErrors: [],
@@ -266,6 +279,7 @@ async function main() {
           if (!c.pid && sample.pid) c.pid = sample.pid;
           c.frames.push(...sample.frames);
           c.events.push(...sample.events);
+          c.arrivals.push(...sample.arrivals);
           c.statsSeries.push(sample.stats);
           if (c.statuses[c.statuses.length - 1] !== sample.status) c.statuses.push(sample.status);
         } catch (err) {
@@ -329,6 +343,7 @@ async function main() {
         if (sample) {
           c.frames.push(...sample.frames);
           c.events.push(...sample.events);
+          c.arrivals.push(...sample.arrivals);
           c.statsSeries.push(sample.stats);
         }
       } catch {
@@ -353,7 +368,7 @@ async function main() {
       drainFailures: c.drainFailures,
       pageErrors: c.pageErrors,
       consoleErrors: c.consoleErrors,
-      analysis: analyse(c.frames, c.events, c.statsSeries, endStats, t0),
+      analysis: analyse(c.frames, c.events, c.statsSeries, endStats, t0, c.arrivals),
     };
   });
 
@@ -402,6 +417,24 @@ function describeNear(e) {
   return '';
 }
 
+/**
+ * The socket ring's cadence in one table cell, in the `rtt min/med` idiom the
+ * table already uses. `none` rather than three zeros when the page reported no
+ * arrivals: a local run cannot open a socket at all (`/api/ws` needs the Vercel
+ * runtime) and a deployment older than the ring reports nothing either, and
+ * both of those read as a perfectly silent socket if printed as numbers.
+ */
+function socketCell(sg) {
+  if (!sg || sg.arrivals < 2) return 'none';
+  return `${sg.maxMs}/${sg.medianMs}/${sg.p99Ms}ms`;
+}
+
+/** Which series saw a gap, and the evidence. See `confirmedBySocket` in `bench/analyse.mjs`. */
+function attribute(g) {
+  if (g.confirmedBySocket === null || g.confirmedBySocket === undefined) return ', unattributed (no socket arrivals)';
+  return g.confirmedBySocket ? `, socket, socket gap ${g.socketGapMs}ms` : ', render, socket saw none';
+}
+
 function renderMarkdown(result, file) {
   const lines = [];
   lines.push(`# tickroom bench, ${result.startedAt}`);
@@ -416,15 +449,16 @@ function renderMarkdown(result, file) {
   lines.push('## What each client rendered');
   lines.push('');
   lines.push(
-    '| client | frames | backward | zero-motion | blank | peak u/s | mean u/s | max snap gap | max serverTime gap | reconnects | swaps (ok/att/fail) | reanchors (max) | stalls | terminals | rtt min/med |'
+    '| client | frames | backward | zero-motion | blank | peak u/s | mean u/s | max snap gap | socket gap max/med/p99 | max serverTime gap | reconnects | swaps (ok/att/fail) | reanchors (max) | stalls | terminals | rtt min/med |'
   );
-  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
   for (const c of result.clients) {
     const a = c.analysis;
     const cl = a.client;
     lines.push(
       `| ${c.name} | ${a.frames} | ${a.rendered.backward} | ${a.rendered.zeroMotion} | ${a.rendered.blankFrames} | ` +
         `${a.rendered.peak} | ${a.rendered.mean} | ${a.snapshotGap.maxMs}ms | ` +
+        `${socketCell(a.socketGap)} | ` +
         `${a.snapshotGap.maxServerTicks} ticks | ${cl.reconnects ?? '?'} | ` +
         `${cl.relaySwaps ?? '?'}/${cl.swapsAttempted ?? '?'}/${cl.swapsFailed ?? '?'} | ` +
         `${a.tick.reanchors.length} (${a.tick.maxAbsReanchor}) | ${a.events.stalls.length} | ` +
@@ -439,6 +473,14 @@ function renderMarkdown(result, file) {
       'out of a hold is reported separately as a resume step.'
   );
   lines.push('');
+  lines.push(
+    'The max snap gap is INFERRED from the render loop (a frame whose `serverTime` moved). ' +
+      "The socket gap column is the same stream timestamped in the socket's own `message` handler, " +
+      'which owes nothing to `requestAnimationFrame`: the median should sit on the 50ms tick, and a ' +
+      'max well under the inferred one means the render loop, not the socket, is what paused. ' +
+      '`none` means the page reported no arrivals at all.'
+  );
+  lines.push('');
 
   for (const c of result.clients) {
     const a = c.analysis;
@@ -446,7 +488,16 @@ function renderMarkdown(result, file) {
     const hs = a.snapshotGap.handoffs;
     const wide = a.snapshotGap.over150.filter((g) => g.gapMs >= GAP_REPORT_MS);
     const cs = a.events.closes;
-    if (rs.length === 0 && hs.length === 0 && wide.length === 0 && cs.length === 0 && a.events.terminals.length === 0) continue;
+    const sg = a.socketGap ?? { arrivals: 0, over250: [] };
+    if (
+      rs.length === 0 &&
+      hs.length === 0 &&
+      wide.length === 0 &&
+      cs.length === 0 &&
+      sg.over250.length === 0 &&
+      a.events.terminals.length === 0
+    )
+      continue;
     lines.push(`### ${c.name}`);
     lines.push('');
     if (hs.length) {
@@ -469,10 +520,32 @@ function renderMarkdown(result, file) {
       for (const g of wide) {
         const near = (g.near ?? []).map((e) => `${e.kind}${describeNear(e)} ${e.dtMs >= 0 ? '+' : ''}${(e.dtMs / 1000).toFixed(1)}s`);
         lines.push(
-          `- at ${(g.atMs / 1000).toFixed(1)}s, ${g.gapMs}ms, epoch ${g.epoch}` +
+          `- at ${(g.atMs / 1000).toFixed(1)}s, ${g.gapMs}ms, epoch ${g.epoch}${attribute(g)}` +
             (near.length ? `, near: ${near.join('; ')}` : ', nothing within 2s')
         );
       }
+      lines.push('');
+      // WHICH SERIES SAW EACH ONE, spelled out once rather than left as a word
+      // on the end of a line. This is the reading the whole socket ring exists
+      // to produce and it is not obvious from `socket`/`render` alone.
+      lines.push(
+        `\`socket\` means the socket's own message handler saw the same hole, so the cause is the socket path ` +
+          'or anything upstream of it; `render` means the arrivals kept coming and only the frames stopped, so the ' +
+          `cause is this client's event loop. A socket gap of at least ${SOCKET_CONFIRM_MS}ms within ${SOCKET_MATCH_MS}ms of the ` +
+          'frame gap is what confirms one.'
+      );
+      lines.push('');
+    }
+    if (sg.arrivals >= 2) {
+      lines.push(
+        `Socket arrivals: ${sg.arrivals}, median gap ${sg.medianMs}ms, p99 ${sg.p99Ms}ms, ` +
+          `max ${sg.maxMs}ms, ${sg.over150} over 150ms.`
+      );
+      lines.push('');
+    }
+    if (sg.over250.length) {
+      lines.push(`Socket arrival gaps over ${GAP_REPORT_MS}ms: ${sg.over250.length}.`);
+      for (const x of sg.over250) lines.push(`- at ${(x.atMs / 1000).toFixed(1)}s, ${x.gapMs}ms`);
       lines.push('');
     }
     if (cs.length) {
