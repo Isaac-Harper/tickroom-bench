@@ -36,24 +36,33 @@ socket. `/api/room` is the balancer: it answers which room instance a joiner
 should land in, and it is here so the documented capacity re-assign recipe has
 something to call rather than to spread bench clients around.
 
-## The Hobby 300s arithmetic, which is the whole reason for the numbers below
+## The duration-cap arithmetic, which is the whole reason for the numbers below
 
-The personal Vercel org is on the Hobby plan, where **300 seconds is the hard
-cap** on a function's `maxDuration`. Both long-lived routes export that literal,
-and both pass the same number to the library as `maxDurationS`. Everything else
-follows by subtraction:
+The personal Vercel team is on the **Pro** plan, where **800 seconds is the hard
+cap** on a function's `maxDuration`. The first runs here were configured at
+**300** instead, which is the platform's own default and also the Hobby cap, and
+that is what runs A to C below are measured at; the deployment runs at 800 now.
+Both long-lived routes export the literal, and both pass the same number to the
+library as `maxDurationS`. Everything else follows by subtraction:
 
-| | derived as | value |
-| --- | --- | --- |
-| ticker `maxRunMs` | `min(700s, 300s - TICKER_EXIT_MARGIN_MS 30s)` | **270s** |
-| relay `lifetimeMs` | `300s - RELAY_EXIT_MARGIN_MS 10s` | **290s** |
-| relay announces `relay-expiring` | `lifetimeMs - RELAY_EXPIRY_LEAD_MS 5s` | **285s** |
+| | derived as | at 800, today | at 300, runs A to C |
+| --- | --- | --- | --- |
+| ticker `maxRunMs` | `min(700s, maxDuration - TICKER_EXIT_MARGIN_MS 30s)` | **700s** | **270s** |
+| relay `lifetimeMs` | `maxDuration - RELAY_EXIT_MARGIN_MS 10s` | **790s** | **290s** |
+| relay announces `relay-expiring` | `lifetimeMs - RELAY_EXPIRY_LEAD_MS 5s` | **785s** | **285s** |
 
-So the room hands off between ticker invocations every 270 seconds, and every
-socket warm-swaps onto a fresh relay every 290 seconds. Those two events are the
-only things a real deployment does that loopback never will, which is why **a
-run shorter than about five minutes measures nothing interesting**: it never
-crosses either one. Twelve minutes crosses roughly two of each.
+So the room hands off between ticker invocations every 700 seconds, and every
+socket warm-swaps onto a fresh relay every 790 seconds; at 300 those periods
+were 270 and 290. Those two events are the only things a real deployment does
+that loopback never will, which is why **a run has to be long enough to cross
+them or it measures nothing interesting**: about five minutes at 300, about
+fourteen at 800. Twelve minutes crossed roughly two of each at 300, and 27
+minutes crosses two of each at 800.
+
+The 700s ceiling on the ticker is the library's own `MAX_TICKER_MS` rather than
+the platform's, so raising `maxDuration` past 730 buys relay lifetime and not
+ticker lifetime. That asymmetry is deliberate in the library: the platform cap
+only ever **lowers** the tick loop's lifetime.
 
 The margins are not slack anyone chose to leave: the ticker's final checkpoint,
 its lease release and its successor spawn all happen after `maxRunMs`, and the
@@ -357,14 +366,18 @@ and it asks for an administrator password.
 ## Results
 
 Measured on **2026-09-03 (UTC)** against `https://tickroom-bench.vercel.app`:
-Vercel project `tickroom-bench` in a personal org on the **Hobby** plan, Next.js
+Vercel project `tickroom-bench` in a personal team on the **Pro** plan, Next.js
 App Router, **Fluid compute**, Node 24, `maxDuration = 300` and
-`maxDurationS: 300` on both long-lived routes, namespace `bench`, base id
-`pong`. Redis is a shared **Upstash** database over TLS (`rediss://`), about 80
-to 87ms round trip from the laptop. The library is `tickroom` 0.2.0 from
-`vendor/`. Clients are headless Chromium driven by Playwright at 60fps with
-`?bot=1`, except run C, which is a real windowed browser process. Every number
-below comes out of a file in `bench/out/`, named under its run.
+`maxDurationS: 300` on both long-lived routes, which is a configuration and the
+platform default rather than this team's cap (run D below is the same room at
+the Pro cap of 800), namespace `bench`, base id `pong`. Redis is a shared **Upstash** database over TLS (`rediss://`), in
+`iad1` with the functions and about 80 to 87ms round trip from the laptop. The
+library is `tickroom` 0.2.0 from `vendor/`. Clients are headless Chromium
+driven by Playwright at 60fps with `?bot=1`, except run C, which is a real
+windowed browser process. Every number in runs A to C comes out of a file in
+`bench/out/`, named under its run; the later runs name their own date, machine
+and file, because runs D and the sweep were driven from the fw13 server's
+Playwright container rather than from the laptop.
 
 ### Run A: three clients, twelve minutes, room `pong` (03:56 to 04:08)
 
@@ -445,6 +458,92 @@ library's docs assumed. The re-anchors are not a fault: `frame()` never runs
 while the tab is dark, so every snapshot re-anchors the counter, and a host's
 `onTickReanchor` fires about every 2s for as long as the tab stays hidden.
 
+### Run D: three clients, 27 minutes at the Pro cap, room `pong` (2026-09-05, 04:15 to 04:42)
+
+`pro-27min.log` on fw13, `--lead 150`. The first run at `maxDuration = 800`, so
+the ticker's lifetime is **700s** and the relay's **790s**: the periods the
+library's own README quotes, rather than the 270 and 290 runs A to C measured.
+
+| | measured |
+| --- | --- |
+| ticker handoffs | both seen by all three clients: at 700s (`15dbf32d` to `b67b3366`) an arrival gap of **50.0 to 50.1ms**, at 1397s (`b67b3366` to `777108b9`) **66.7 to 83.4ms**, server grid gap exactly **50ms** both times |
+| relay warm swaps | **2/2/0** per client, and the retired sockets closed **1005 clean** at 788s and 1574s |
+| reconnects, stalls, terminals | **0**, **0**, **0** |
+| mean rendered marker speed | exactly **100** on all three |
+
+**And the client-side numbers are the worst this bench has produced, which is
+the container and not the platform.** This run rendered in three headless
+Chromiums inside a Docker container on the 16-core server while a second
+three-client run shared the box, and it shows: zero-motion frames 35 to 61 per
+client, worst arrival gaps of 650 to 933ms (most of them in the first 75
+seconds, at 833, 650 and 450ms), peaks up to 3290 u/s, RTT medians of 91 to
+117ms against 80ms minimums, and **one backward step on one client in 97,000
+frames**, which is the first backward step in any run here. That is a renderer
+starved of CPU, and it is exactly what the marker is for: every one of those
+numbers is a client-side deviation, and none of them touches the server-side
+facts in the table above. A handoff cost, a swap outcome and a reconnect count
+do not depend on the browser drawing on time. Measure smoothness on a quiet
+machine; measure a handoff wherever it is convenient.
+
+### Run E: one genuinely hidden tab in a real Google Chrome, 6.5 minutes, room `pong~5` (2026-09-05)
+
+`bench/out/hidden-2026-09-05T05-03-22-854Z.json`, `--chrome` mode picking up
+**Google Chrome 152.0.7977.83** from `/Applications` rather than falling back to
+Playwright's Chromium build, which is the caveat run C carried.
+
+| | measured |
+| --- | --- |
+| tab state | genuinely hidden, **1 frame rendered** in 6.5 minutes |
+| client pings | 15 per 30s through the first minute, then **about one a minute**; **47** in total |
+| socket | open the whole time, **0 reconnects**, no closes, no terminals, still in the roster on return |
+| crossed while hidden | none: at 800s the relay lifetime is 790s and the ticker's is 700s, both longer than the run |
+| recovery on show | first rendered frame and drawn in the roster at **1.019s** |
+| tick re-anchors | **201**, max delta 44 |
+
+The same result as Chrome for Testing 151 gave, on the browser a player actually
+runs. The throttle arrives at the same place (the second minute, not the fifth),
+the 90s liveness default holds it with room, and the re-anchors are `frame()`
+not running rather than a fault. What is left after this is Safari and mobile.
+
+### Run F: a discarded tab, room `pong~8` (2026-09-05)
+
+`bench/out/discard-2026-09-05T05-00-05-297Z.json`, real Chrome 152, driven by
+`bench/discard.mjs` over raw CDP. An **urgent** discard from `chrome://discards`
+after pressing the enable button on `chrome://chrome-urls`; the row read
+`discarded (urgent)` with a timestamp and `document.wasDiscarded` was true on
+return, which is the confirmation that matters.
+
+| | measured |
+| --- | --- |
+| revived by | **`Page.reload`** at 6.4s. Chrome 152 accepted the activation and left the tab dead, because the machine was locked and the window was never really shown |
+| first rendered frame | **0.27s** after that reload |
+| a new player id minted | **0.37s** |
+| socket open | **0.69s** |
+| drawn in the roster again | **0.79s** |
+| reconnects on the new connection | **0**, because a reload is not a reconnect |
+| the discarded client's seat | **already gone** in the first roster the reloaded page drew |
+
+**That last row is the finding.** The expectation going in was that the dead
+seat would sit in the room until the relay's 90s liveness deadline reaped it.
+It does not: the discard kills the renderer, the socket dies with it, and the
+relay drops the player at once, so the deadline never enters. A discarded tab is
+a reload, a reload is a fresh session, and nothing in the library needs to
+survive one. Chrome 152 also destroys the page target and makes a new one for
+the same tab, where Chrome for Testing 151 kept the id; both behaviours are
+handled in the harness rather than assumed, and the header of `discard.mjs`
+says how.
+
+### Safari: written, and blocked on a setting
+
+`bench/hidden-safari.mjs` is the hidden-tab measurement on the actual Safari.app
+over `safaridriver`, and it does not run yet. Safari 26 refuses session creation
+until **Allow remote automation** is enabled in Safari Settings > Developer, a
+setting the running Safari reads at launch (so it needs a quit and reopen), with
+`sudo safaridriver --enable` as the other half on a machine that has never run a
+WebDriver session, which asks for an administrator password. Both need a human.
+The Safari and mobile hidden-tab runs are therefore still owed, and every
+throttling number above remains a statement about Chromium.
+
 ### Cold start and join latency
 
 First snapshot after the page's first rendered frame:
@@ -471,21 +570,28 @@ Across all 73 client-minutes: zero backward steps, zero blank frames, mean speed
 exactly 100. The library's loopback harness never sees a gap above 149ms, so the
 band belongs to the network path rather than to tickroom's scheduling. A host's
 lever is the interpolation delay floor, trading roughly 200ms of remote-entity
-latency for absorbing the second band; the measurements worth making next are a
-same-region Redis and an in-function latency probe.
+latency for absorbing the second band. Both measurements this paragraph used to
+name as owed have since been made, and neither found Redis: the database is in
+the same region as the functions, and the in-function probe below reads a p99
+of about 2ms. The band is downstream of the relay, and the entry after the
+probe has how far the attribution got.
 
 Three more caveats worth carrying with every number above:
 
-- **Chrome for Testing, not Google Chrome.** `--chrome` prefers a real installed
-  Google Chrome and falls back to Playwright's own Chromium build, and this
-  machine has no Google Chrome, so run C is Chromium's official build running as
-  a real windowed process. Safari and mobile are untested entirely.
+- **Chrome for Testing, not Google Chrome**, in run C: `--chrome` prefers a real
+  installed Google Chrome and falls back to Playwright's own Chromium build, and
+  the machine had no Google Chrome at the time, so run C is Chromium's official
+  build running as a real windowed process. Run E above is the same measurement
+  on Google Chrome 152 and reads the same. **Safari and mobile are still
+  untested**, for the reason the Safari entry gives.
 - **The clients are a laptop about 80ms away**, on residential wifi, not another
   machine in the deployment's region. Every client-side gap carries that round
   trip in it.
-- **The Upstash database's region is unknown**, and it is a shared database
-  rather than one provisioned for this bench. Nothing here separates a slow
-  region from a slow provider.
+- **The Upstash database is shared** rather than provisioned for this bench.
+  Its region is no longer unknown: it is `iad1`, the same region as the
+  functions, and the in-function probe below measures that leg at a p99 of
+  around 2ms, so a slow region and a slow provider are both ruled out as the
+  cause of the band.
 
 ### Attributing the bus tail
 
@@ -519,6 +625,58 @@ in the probe's own `p99`, `max` or `over150` is the Redis path, measured with
 the browser and the relay both removed. A tail `run.mjs` sees on the same
 deployment that the probe never reproduces belongs to the relay or to the
 client's own socket instead, not to Redis.
+
+**Measured on 2026-09-05, from `iad1` to `helped-teal-156650.upstash.io`:**
+
+| run | samples each | PING | PUBLISH to SUBSCRIBE |
+| --- | --- | --- | --- |
+| 60s (`bench/out/probe-2026-09-05T04-13-08-767Z.json`) | 601 | p50 **1.26ms**, p90 1.84, p99 2.35, max 22.27 | p50 **1.28ms**, p90 1.52, p99 2.10, max 22.02 |
+| 240s (`bench/out/probe-2026-09-05T04-14-50-624Z.json`) | 2406 | p50 **1.46ms**, p90 2.04, p99 2.38, max 14.14 | p50 **1.66ms**, p90 1.90, p99 2.32, max 19.63 |
+
+**No sample over 150ms in either run**, and the region came back `iad1`, the
+same region the functions run in, which retires the other measurement this
+README said was worth making. So the 250 to 433ms snapshot arrival gaps the
+clients see are **not in the Redis path**. What is left is the relay function
+(its subscriber's event loop, or the function being paused between snapshots) or
+the socket path to the browser.
+
+**The library's own next instrument is `relay.gaps`, and it separates those
+two.** The relay measures the inter-arrival gap on its own subscriber
+(`busGapMax`, `busGapOver150`) and the time from a bus arrival to the send
+returning (`sendLagMax`) per heartbeat window, and logs one line at info only
+when `busGapMax` passes 150 or `sendLagMax` passes 50. Read it this way: a
+`relay.gaps` line with a `busGapMax` matching a gap a client reported means the
+cause is **upstream of the socket** (the ticker, the bus, or the function being
+paused), and a client gap with **no** relay line beside it means the **socket
+path**. A healthy socket logs nothing, so the absence of a line is half the
+reading rather than a missing measurement.
+
+**And the first attribution run read the second way, which is the answer.** Ten
+minutes, three clients, room `pong` at `--lead 150` from the fw13 container on
+2026-09-05 (05:07 to 05:17 UTC), against the deployment carrying the
+instrumentation. The clients reported **eight** arrival gaps over 250ms (550,
+267, 267, 283, 267, 383, 300 and 250ms), and the Vercel runtime log carries
+**not one `relay.gaps` line** for that window, while other relay lines from the
+same deployment are present in it, so info-level capture is proven rather than
+assumed. The relay therefore saw no bus gap over 150ms and no send lag over
+50ms in any heartbeat window of that run: every one of those gaps is
+**downstream of the relay's `send` returning**. Together with the probe above,
+that clears the ticker, the bus and the relay function, and leaves the socket
+path between the function and the browser (Vercel's WebSocket edge, or the
+network) or the client's own event loop. The room's counters for the run:
+`starves` 71, `lateInputs` 67 over about 12,000 ticks, tick rate 19.96 to
+20.95Hz.
+
+**The caveat is the client, and it is the same caveat run D carries.** This run
+rendered inside a Docker container on a loaded box, and every arrival time this
+bench quotes is inferred from **frames**, so a container render stall reads as
+an arrival gap. The Mac runs saw the same 250 to 433ms band at a lower rate,
+which is what makes the band real and this run's rate the wrong number to
+quote. **Still owed:** a client-side probe that timestamps socket `message`
+events independently of the render loop, a ring of `onmessage` timestamps in
+the bench page, which is what separates the socket path from the client's own
+loop. Until that exists, "downstream of the relay" is as far as this
+attribution goes.
 
 ### The input timeline off-by-one, 2026-09-03
 
@@ -735,6 +893,37 @@ flips, 0% of held frames motionless, largest single-frame step 1.59 units,
 both grades PASS. The library's own suite: 1101 tests across 39 files, green
 on a quiet machine.
 
+### The headroom sweep, 2026-09-05
+
+`--lead` exists for this. Three five-minute three-client runs from the fw13
+container against the deployment, one headroom each, rooms `pong~3`, `pong~4`
+and `pong~6`, between 04:59 and 05:45 UTC. The container's round trip is a
+minimum of about 80ms with medians of 87 to 99ms, so this is a jitterier path
+than the Mac runs above, which is the point: a headroom is jitter insurance.
+Room counters over about 6,000 ticks each.
+
+| headroom | starves | lateInputs | re-anchors per client | zero-motion frames per client | max arrival gap |
+| --- | --- | --- | --- | --- | --- |
+| 100ms | 345 | 362 | 0, 0, 1 | 0, 37, 14 | 233 to 617ms |
+| **150ms** | **53** | **56** | 1, 1, 1 | 3, 10, 1 | 250 to 383ms |
+| 200ms | 36 | 31 | 1, 1, 1 | 10, 8, 2 | 267 to 350ms |
+
+**100 to 150 cuts starves and late inputs about 6.5x, and the re-anchor column
+says why.** After the consume-on-produced-tick fix the cushion at 100ms is one
+tick, and the `inputLead` loop's two-tick deadband never lifts a buffer that
+shallow, so the loop sits the whole run out (re-anchors 0) and the starves are
+simply paid. 150 to 200 buys another 1.5x for one more tick, 50ms, of input
+latency on **every** action. So 150 is the knee and stays the library's
+default; a host on a jittery path (mobile, a container, this run) sets
+`inputLeadMs: 200`.
+
+**This is a sweep of the headroom, not of the target.** `TARGET_DEPTH_TICKS`
+(2), the depth the feedback loop aims the buffer at, was deliberately not swept
+beside it: the one-tick-deadband measurement above already showed that the
+LOOP rather than the target is what governs a one-tick cushion, and sweeping
+the target itself would mean exposing the constant as a host option, which the
+library deliberately does not do.
+
 ## Running locally
 
 ```bash
@@ -772,13 +961,14 @@ app/
   layout.tsx, globals.css   chrome, one stylesheet
   api/session/route.ts      mints pid + handle + HMAC token, rate limited
   api/room/route.ts         createBalancerRoute, for the capacity re-assign path
-  api/ticker/route.ts       createTickerRoute, maxDuration 300
-  api/ws/route.ts           createRelayRoute, maxDuration 300
+  api/ticker/route.ts       createTickerRoute, maxDuration 800
+  api/ws/route.ts           createRelayRoute, maxDuration 800
+  api/probe/route.ts        the in-function Redis latency probe, gated by key
 game/
   pong.ts                   the RoomConnection wiring and the measurement hook
   bench.ts                  the record shapes window.__bench exposes
 lib/
-  rooms.ts                  namespace, base, capacity, the 300s arithmetic
+  rooms.ts                  namespace, base, capacity, the duration-cap arithmetic
   secret.ts                 fail-closed SESSION_SECRET
   tickerUrl.ts              the Deployment Protection bypass, and why
   upgradeWebSocket.ts       the one platform seam
@@ -792,6 +982,7 @@ bench/
   hidden-safari.mjs         the same, in real Safari over WebDriver
   discard.mjs               one client's renderer killed, then the tab brought back
   paddle.mjs                one client, a held key: reconciliation and motion regularity
+  probe.mjs                 calls /api/probe and prints both latency series
   analyse.mjs               the library's own smoothness analysis, ported
   page.mjs                  what every harness needs from a page, once
   chrome.mjs                starting, attaching to and quitting a real browser process
