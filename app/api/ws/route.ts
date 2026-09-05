@@ -11,7 +11,8 @@ import { decodeJsonInput } from '@/lib/wire';
  * route module itself, and 800 is the Pro plan's hard cap (300 was the first
  * configuration, also the Hobby cap). The adapter
  * derives `lifetimeMs` as `maxDurationS * 1000 - RELAY_EXIT_MARGIN_MS`, so this
- * announces `relay-expiring` at 285 seconds and closes at 290, and the client
+ * announces `relay-expiring` at 785 seconds and closes at 790 (285 and 290 at the
+ * first configuration of 300), and the client
  * swaps to a replacement socket in between. Without that the socket would
  * simply be dropped at every cap.
  */

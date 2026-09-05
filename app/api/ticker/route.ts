@@ -18,7 +18,8 @@ import { createPongRuntime } from '@/sim/pong';
  * platform kills the function, and the loop has to be finished, checkpointed,
  * released and succeeded by then. The adapter derives `maxRunMs` as
  * `maxDurationS * 1000 - TICKER_EXIT_MARGIN_MS` capped at 700s, so 800 gives a 700 second tick
- * loop and therefore a planned handoff every 270 seconds. Nothing at runtime
+ * loop and therefore a planned handoff every 700 seconds (270 at the first
+ * configuration of 300). Nothing at runtime
  * can read a route module's static exports back, which is why the pair is
  * checked by eye here and by the assertion below for the parts that can be.
  */
@@ -47,7 +48,7 @@ if (createPongRuntime('probe').tickHz !== TICK_HZ) throw new Error('pong tickHz 
  *
  * BUILT PER REQUEST, WHICH IS THE ONLY WAY `inst` CAN BE HONEST. See `GET`
  * below for what module scope cost. `createTickerRoute` validates its numbers
- * and returns a closure, so one per invocation costs an object next to a 270
+ * and returns a closure, so one per invocation costs an object next to a 700
  * second loop.
  */
 const tickerRouteFor = (inst: string) =>

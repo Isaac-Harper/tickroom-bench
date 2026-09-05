@@ -82,10 +82,11 @@ export const PRESENCE_TIMEOUT_MS = 60_000;
  *   relay   lifetimeMs = 800s - RELAY_EXIT_MARGIN_MS 10s            = 790s
  *   (at 300s, the first measurements: 270s and 290s)
  *
- * So a room hands off between ticker invocations every 270 seconds and every
- * socket warm-swaps to a fresh relay every 290 seconds. A twelve minute run
+ * So a room hands off between ticker invocations every 700 seconds and every
+ * socket warm-swaps to a fresh relay every 790 seconds (270 and 290 in the
+ * first runs at 300). A twelve minute run
  * therefore crosses roughly two of each, which is why twelve minutes is the
- * shortest run worth doing: a run under 290s measures a deployment that never
+ * shortest run worth doing: a run under one relay lifetime measures a deployment that never
  * exercised either mechanism.
  *
  * IT MUST EQUAL THE `maxDuration` LITERAL EACH ROUTE FILE EXPORTS. Next reads
