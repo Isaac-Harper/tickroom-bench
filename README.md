@@ -507,7 +507,9 @@ Playwright's Chromium build, which is the caveat run C carried.
 The same result as Chrome for Testing 151 gave, on the browser a player actually
 runs. The throttle arrives at the same place (the second minute, not the fifth),
 the 90s liveness default holds it with room, and the re-anchors are `frame()`
-not running rather than a fault. What is left after this is Safari and mobile.
+not running rather than a fault. Safari is run G below; what is left after both
+of them is mobile, and a Safari read that does not switch to the tab to take its
+samples.
 
 ### Run F: a discarded tab, room `pong~8` (2026-09-05)
 
@@ -537,16 +539,48 @@ the same tab, where Chrome for Testing 151 kept the id; both behaviours are
 handled in the harness rather than assumed, and the header of `discard.mjs`
 says how.
 
-### Safari: written, and blocked on a setting
+### Run G: a hidden tab in real Safari, 6.5 minutes, room `pong~9` (2026-09-05)
 
-`bench/hidden-safari.mjs` is the hidden-tab measurement on the actual Safari.app
-over `safaridriver`, and it does not run yet. Safari 26 refuses session creation
-until **Allow remote automation** is enabled in Safari Settings > Developer, a
-setting the running Safari reads at launch (so it needs a quit and reopen), with
-`sudo safaridriver --enable` as the other half on a machine that has never run a
-WebDriver session, which asks for an administrator password. Both need a human.
-The Safari and mobile hidden-tab runs are therefore still owed, and every
-throttling number above remains a statement about Chromium.
+`bench/out/hidden-safari-2026-09-05T05-55-52-314Z.json`, the actual Safari.app
+(**Version/26.6.2**, `AppleWebKit/605.1.15`) driven by `bench/hidden-safari.mjs`
+over `safaridriver`, which ran once the user had enabled **Allow remote
+automation** and run `sudo safaridriver --enable`. Playwright's WebKit is not
+Safari, so this is the only run on this page that says anything about Safari's
+own policy.
+
+**Read the caveat first, because it is about how the tab was watched rather than
+about what it did.** The harness prefers to leave its WebDriver handle on the
+backgrounded client and script it from there, and it verifies that on the spot;
+here `execute/sync` would not report the client's state while the empty front
+tab was showing, so it fell back to its documented `switch-and-return` mode:
+switch to the client for each 30s sample, read, switch back. That makes the tab
+briefly visible **13 times**, so this is a tab hidden **thirty seconds at a
+time**, not one hidden for 6.5 minutes straight. The 151 frames below are those
+switch moments and nothing else.
+
+| | measured |
+| --- | --- |
+| tab state | `document.hidden` **true on every sample**, 13 of 13 |
+| frames rendered | **151** in 6.5 minutes, all of them at the switch moments |
+| client pings while hidden | **93**, about **one every four seconds** |
+| socket | open the whole time, **0 reconnects**, no closes, no terminals, still in the roster on return |
+| crossed while hidden | none: no relay swap and no ticker handoff, at a 790s relay lifetime and a 700s ticker |
+| recovery on show | first drawn frame and back in the roster at **1.007s** |
+| tick re-anchors | **203**, max delta 55 |
+
+**The one number that differs from Chromium is the throttle, and it differs in
+the safe direction.** Chromium drops a hidden tab to about one timer callback a
+minute from the second minute; Safari held roughly one every four seconds across
+the whole run, so it clamps the client's 2s ping cadence far less. The 90s
+liveness default is sized against the stingiest browser, and at Safari's
+throttling it is never approached. Recovery is the same as Chrome's to within a
+few milliseconds, and the re-anchors are `frame()` not running rather than a
+fault, exactly as in runs C and E.
+
+**What is still owed** is a Safari read taken *without* the per-sample switch,
+which needs a way to observe a background tab that does not raise it: a
+`BroadcastChannel` to a visible helper tab, or the page posting its own state to
+the server on the socket it already has. And mobile, which nothing here touches.
 
 ### Cold start and join latency
 
@@ -562,7 +596,9 @@ Each figure is a mint, an upgrade and a first snapshot at about 80ms round trip.
 
 ### What the runs do not prove
 
-**The 250 to 433ms band is the platform's pub/sub tail, and it is unattributed.**
+**The 250 to 433ms band is the platform's socket tail, and it is attributed now**
+(this paragraph called it unattributed until the arrivals ring ran; the
+entry after the probe has that run)**.**
 On this path (a Vercel function, to Upstash over TLS, to another Vercel
 function, to a browser 80ms away) arrival gaps of 150 to 250ms land about once a
 minute per client and gaps of 250 to 433ms about once per five client-minutes,
@@ -577,8 +613,9 @@ lever is the interpolation delay floor, trading roughly 200ms of remote-entity
 latency for absorbing the second band. Both measurements this paragraph used to
 name as owed have since been made, and neither found Redis: the database is in
 the same region as the functions, and the in-function probe below reads a p99
-of about 2ms. The band is downstream of the relay, and the entry after the
-probe has how far the attribution got.
+of about 2ms. The band is downstream of the relay AND upstream of the browser's
+`message` event, confirmed at the socket 5 times out of 5, so it is the
+WebSocket path itself; the entry after the probe has the run.
 
 Three more caveats worth carrying with every number above:
 
@@ -586,8 +623,9 @@ Three more caveats worth carrying with every number above:
   installed Google Chrome and falls back to Playwright's own Chromium build, and
   the machine had no Google Chrome at the time, so run C is Chromium's official
   build running as a real windowed process. Run E above is the same measurement
-  on Google Chrome 152 and reads the same. **Safari and mobile are still
-  untested**, for the reason the Safari entry gives.
+  on Google Chrome 152 and reads the same. Safari is measured in run G, with the
+  per-sample-switch caveat that entry states, and it throttles far less than
+  Chromium. **Mobile is still untested.**
 - **The clients are a laptop about 80ms away**, on residential wifi, not another
   machine in the deployment's region. Every client-side gap carries that round
   trip in it.
@@ -742,6 +780,44 @@ What the ring cleanly rules out is the case that actually threatened run D's
 reading: a render loop starved while the socket kept delivering. So `socket`
 means "not only the render loop", and the wording in the report says the socket
 path **or upstream**, never "the network".
+
+**And the run with the ring in it is the answer.** Ten minutes, three clients,
+room `pong~10` at `--lead 150` from the fw13 container on 2026-09-05 (07:44 to
+07:54 UTC), against the deployment carrying both `relay.gaps` and the page's
+arrivals ring.
+
+| | measured |
+| --- | --- |
+| socket arrivals per client | about **12,000** |
+| socket gap, median | **49.8ms**, on a 50ms grid |
+| socket gap, p99 | **69 to 75ms** |
+| frame-inferred gaps over 250ms | 5 in all: bot0 one, bot1 one, bot2 three |
+| how many the socket confirmed | **5 of 5**, every one within a few ms |
+| verdicts | **`socket` x5, `render` x0**, nothing within 2s of any of them |
+| `relay.gaps` lines in the window | **zero** |
+
+Per gap: bot0 267ms inferred against **252ms** at the socket; bot1 417 against
+**416**; bot2 433/**428**, 700/**709** and 283/**276**. **Read that as the end of
+the attribution.** The relay saw no bus gap over 150ms and no send lag over 50ms,
+so the holes are downstream of `send` returning; the socket's own handler saw
+them, so they are upstream of the browser's `message` event. What sits between
+those two points is the WebSocket path from the function through Vercel's edge
+to the client, or the network to the container. The ticker, the bus, the relay
+function and the render loop are all cleared, and the band is a **platform
+property** rather than anything this library or this page schedules. The lever a
+host has is the interpolation delay floor, which is what the "what the runs do
+not prove" section already said and can now say without a hedge.
+
+The rest of that run: backward steps **0, 0 and 2** (bot2, all across the 700ms
+hole), zero-motion frames 2, 9 and 50, `reconnects` 0, no swaps at a 790s relay
+lifetime, and the room's own `starves` 87 and `lateInputs` 82 at 19.96 to 21Hz.
+
+**Two things are still owed, and both are narrow.** The same run from a client
+on a **quiet machine on a residential link**, because this one is a container on
+a loaded box and the Mac runs saw the same band at a lower rate; and a
+**whole-process stall detector** in the page, a `setInterval` heartbeat gap ring
+beside the arrivals one, because a blocked event loop stops the message handler
+too and is the one case a confirmation at the socket cannot distinguish.
 
 ### The input timeline off-by-one, 2026-09-03
 
