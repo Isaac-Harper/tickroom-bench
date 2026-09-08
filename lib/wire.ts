@@ -8,12 +8,11 @@ import type { ClientInput } from 'tickroom/core';
  *
  * THE PARAMETER IS `unknown` RATHER THAN `ArrayBuffer`, and that is not
  * defensive typing. The real transport behind the relay route is the `ws`
- * package, which hands over a `Buffer`, or an ARRAY of them for a fragmented
- * message. Fragmentation is chosen by the peer or by a proxy and nothing about
- * a frame's size prevents it, so a decoder that assumed a browser-style
- * ArrayBuffer would work in every local test and then drop one client's inputs
- * in production for as long as something upstream felt like fragmenting.
- * `Buffer.concat` is the whole of the normalisation.
+ * package, which hands over a `Buffer`. A FRAGMENTED message (an array of
+ * buffers, chosen by the peer or by a proxy) used to reach this decoder as an
+ * array and had to be joined here; tickroom 0.3.0's relay joins fragments
+ * itself before `decodeInput` is ever called, so this decoder sees only what
+ * `attachRelay` now promises: a single `Buffer`.
  *
  * THIS IS A TRUST BOUNDARY. Everything it returns was chosen by a client, so it
  * validates the SHAPE here (an object at all, a finite `seq`, a finite
@@ -26,8 +25,7 @@ import type { ClientInput } from 'tickroom/core';
  * frame.
  */
 export function decodeJsonInput(data: unknown): ClientInput[] {
-  const bytes = Array.isArray(data) ? Buffer.concat(data as Buffer[]) : (data as Buffer);
-  const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+  const parsed: unknown = JSON.parse(new TextDecoder().decode(data as Buffer));
   const list = Array.isArray(parsed) ? parsed : [parsed];
   const out: ClientInput[] = [];
   for (const item of list) {

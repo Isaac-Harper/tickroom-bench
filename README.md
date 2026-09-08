@@ -123,12 +123,13 @@ Environment variables:
   Protection off is the better answer for this project**, because a bench should
   measure the public path.
 
-`vendor/tickroom-0.2.0.tgz` is committed on purpose. The library repo is
-private, so a git or registry dependency would not install on a build machine
-with no credentials, and a committed tarball is the only form that resolves with
-no auth at all. To pick up a library change: `npm pack` in the tickroom repo,
-copy the tarball into `vendor/`, update the path in `package.json` if the
-version moved, delete the stale tarball, and `npm install`.
+`tickroom` installs from the registry now: `npm install tickroom@0.3.1`. It is
+pinned exactly (`"tickroom": "0.3.1"`, no `^`) rather than left to float,
+because `1.0.0` is also published and is `latest` on the registry, and it is a
+breaking release this project has not migrated to. A caret here would pick it
+up on the next `npm install` with no diff in this repo to review. To pick up a
+later library version on purpose: bump the pin in `package.json`, run
+`npm install`, and work through `CHANGELOG.md` for what changed.
 
 ## Running the harness
 
@@ -1113,7 +1114,7 @@ lib/
   secret.ts                 fail-closed SESSION_SECRET
   tickerUrl.ts              the Deployment Protection bypass, and why
   upgradeWebSocket.ts       the one platform seam
-  wire.ts                   the JSON input decoder, and the Buffer fragmentation trap
+  wire.ts                   the JSON input decoder
   mintLimit.ts              in-process per-IP mint limit
 sim/
   pong.ts                   the room, with the constant-velocity marker
@@ -1127,8 +1128,6 @@ bench/
   analyse.mjs               the library's own smoothness analysis, ported
   page.mjs                  what every harness needs from a page, once
   chrome.mjs                starting, attaching to and quitting a real browser process
-vendor/
-  tickroom-0.2.0.tgz        the dependency itself
 ```
 
 ## What was changed from the library's example, and why
