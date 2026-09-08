@@ -59,9 +59,16 @@ export interface BenchFrame {
   extrap: boolean | null;
   /** This client's OWN paddle as the interpolator rendered it. Its only mover is this client's own stamped inputs, so it is the per-sender half of fairness. */
   ownX: number | null;
-  /** This client's OWN paddle as it was DRAWN: what `PredictedEntity.advance` returned, the prediction interpolated across its last stamped tick plus what is left of the last correction. The number a player's eye follows, where `ownX` is the server's delayed view of the same paddle. */
+  /** This client's OWN paddle as it was DRAWN: `conn.frame(now, input).own`, the prediction read at a render playhead one tick behind the newest stamp plus what is left of the last correction. The number a player's eye follows, where `ownX` is the server's delayed view of the same paddle. `null` until the first authoritative pose has been reconciled, which is also when there is nothing of ours to draw. */
   ownY: number | null;
-  /** The raw prediction alone (`PredictedEntity.pose.y`, the pose after the last stamped tick), and the drawn y minus it: the between-tick interpolation plus the correction offset, so a wobble can be attributed to the prediction or to the draw. `errZ` used to be the offset alone, when the page held the offset itself; the entity does not expose the two parts separately, so the split is now prediction versus everything the draw adds. */
+  /** The raw prediction alone (`conn.own`, the pose after the last stamped tick, with no playhead and no glide in it), and the drawn y minus it: the between-tick interpolation plus the correction offset, so a wobble can be attributed to the prediction or to the draw. `errZ` used to be the offset alone, when the page held the offset itself; the connection does not expose the two parts separately, so the split is prediction versus everything the draw adds.
+   *
+   *  `predictedY` IS NON-NULL BEFORE `ownY` IS, unlike in 0.3.x where both were
+   *  gated on the roster naming this pid. `conn.own` is the prediction's own
+   *  pose, which starts at `predict.initial` and is a real number from the first
+   *  frame, where `frame().own` is `null` until the first authoritative pose has
+   *  been reconciled. `errZ` is null whenever either half is, so the pair the
+   *  analysis reads still moves together. */
   predictedY: number | null;
   errZ: number | null;
   /** Every entity this frame drew, as `[id, x, y]`. How a client's view of the ROSTER is measured rather than just its view of the marker. */
@@ -82,7 +89,25 @@ export interface BenchEvent {
     | 'rate-mismatch'
     | 'mint-error'
     | 'roster'
-    /** One per snapshot naming this pid: `snapTick`, the entity's stamped `tick`, the replay `error` as a magnitude (`PredictedEntity.stats.lastError`) and `serverY`. The hand-written window's `covered` and `missing` fields are gone: the entity keeps a replay history deeper than its re-send window, so the shortfall they measured no longer occurs, and `bench/paddle.mjs`'s "window shortfalls" count reads zero by construction. */
+    /**
+     * One per snapshot naming this pid: `snapTick`, the counter's own `tick`,
+     * the server's `serverY`, and the replay `error` as a magnitude
+     * (`conn.ownStats.lastError`). The hand-written window's `covered` and
+     * `missing` fields are gone: the prediction keeps a replay history deeper
+     * than its re-send window, so the shortfall they measured no longer occurs,
+     * and `bench/paddle.mjs`'s "window shortfalls" count reads zero by
+     * construction.
+     *
+     * `error` LANDS ONE FRAME AFTER THE REST OF THE RECORD, and that is the
+     * only thing the 1.0.0 fold of `PredictedEntity` into the connection cost
+     * this hook. The event is written in `onSnapshot`, which is the only
+     * callback a snapshot reaches, and the connection reconciles the prediction
+     * AFTER that callback returns, so the error the reconcile produces does not
+     * exist yet when the rest of the record does. `game/pong.ts` parks the
+     * event and fills the field from `conn.ownStats.lastError` on whichever
+     * comes first, the next frame or the next snapshot; see `pendingReconcile`
+     * there for the one case that leaves the field ABSENT rather than late.
+     */
     | 'reconcile'
     /** The underlying socket's own close, with its code and reason. Not something the library reports: it turns a close into a status change and a reconnect, and the code is gone by then. See `BenchSocket` in `game/pong.ts` for the seam that sees it. */
     | 'close';

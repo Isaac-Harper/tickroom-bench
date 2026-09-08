@@ -1,13 +1,23 @@
 // The browser half, and the instrument.
 //
 // This is `examples/pong/client.ts` from the library, wired exactly as the
-// README's step 3 shows: tickHz matching the simulation, `decodeSnapshot`
-// lifting this pid's own `inputLead` out of the per-paddle field, an
-// interpolator driven by the connection itself, the paddle owned by a
-// `PredictedEntity` running the simulation's own `stepPaddleY`,
-// `onStallChange`, `onTickReanchor` as telemetry, and `onTerminal` with the
-// documented bounded re-assign. Read the library's copy for why each of those
-// is shaped the way it is; the reasoning is unchanged and is not repeated here.
+// README's step 3 shows: tickHz matching the simulation, a plain
+// `decodeSnapshot`, an interpolator the connection constructs and drives, the
+// paddle predicted by the connection's own `predict` option running the
+// simulation's own `stepPaddleY`, `onStallChange`, `onTickReanchor` as
+// telemetry, and `onTerminal` with the documented bounded re-assign. Read the
+// library's copy for why each of those is shaped the way it is; the reasoning
+// is unchanged and is not repeated here.
+//
+// TWO OF THOSE USED TO BE THIS FILE'S OWN WORK AND ARE THE LIBRARY'S AT 1.0.0.
+// The paddle was a hand-held `PredictedEntity` beside the connection, with the
+// order of its `advance`, `reconcile` and `snapTo` calls left to this file; it
+// is `predict: { step, maxSpeed, ownPose, wire }` on the connection now, with
+// `conn.frame(now, input)` the one per-frame call and `frame().own` the pose to
+// draw. And the server's playout depth used to ride this app's own snapshot as
+// a per-paddle `inputLead` that `decodeSnapshot` lifted out; the library
+// carries it on its own control frames now, so `PongSnapshot` is the plain
+// shape `sim/pong.ts` publishes and nothing here touches the stamping lead.
 //
 // THREE THINGS ARE ADDED, all of them because this page is measured by a robot
 // rather than played by a person:
@@ -31,9 +41,7 @@
 //    measure the balancer instead.
 
 import {
-  PredictedEntity,
   RoomConnection,
-  SnapshotInterpolator,
   isRosterFrame,
   type EntitySample,
   type SessionInfo,
@@ -54,12 +62,15 @@ interface PongSnapshot {
   markerX: number;
   serveIn: number;
   winner: string | null;
-  paddles: { pid: string; side: 'left' | 'right'; y: number; score: number; inputLead: number }[];
-  /** OUR OWN pid's playout depth, lifted out of `paddles` in `decodeSnapshot`. The one field `RoomConnection` reads out of a host's snapshot beyond `tick` and `serverTime`. */
-  inputLead?: number | undefined;
+  paddles: { pid: string; side: 'left' | 'right'; y: number; score: number }[];
 }
 
-/** Must equal `pongRuntime.tickHz` and `TICK_HZ` in lib/rooms.ts. Stated once for the connection; the prediction reads its timestep off `conn.tick.tickMs`. */
+/** What one stamped record carries: the held direction, already clamped by `readDir`. Not a `DefaultInput` (`{ axes, buttons }`), which is why `predict.wire` below is `'json'`. */
+interface PongInput {
+  dir: number;
+}
+
+/** Must equal `pongRuntime.tickHz` and `TICK_HZ` in lib/rooms.ts. Stated once for the connection; the prediction it owns reads its timestep off the same counter. */
 const TICK_HZ = 20;
 
 /** Where a paddle sits for each side. The server owns the assignment; this is only where to draw it. */
@@ -101,7 +112,6 @@ export interface PongOptions {
 
 export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => void {
   const ctx = canvas.getContext('2d')!;
-  const interp = new SnapshotInterpolator<string>();
 
   // ---- the measurement buffers -------------------------------------------
 
@@ -123,6 +133,43 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
   /** `performance.now()` at start, so every `t` in a run is relative to the same origin as the harness's own samples. */
   const record = (kind: BenchEvent['kind'], detail: Record<string, unknown>): void => {
     eventBuf.push({ t: performance.now(), kind, detail });
+  };
+
+  /**
+   * THE ONE RECORD THIS PAGE CANNOT FILL IN WHERE IT WRITES IT, and the whole
+   * of what the fold of `PredictedEntity` into the connection cost the
+   * instrument.
+   *
+   * A `reconcile` event is written in `onSnapshot`, because that is the only
+   * callback a snapshot reaches. The connection reconciles the prediction
+   * AFTER `onSnapshot` returns (deliberately: the replay runs the host's `step`
+   * from the server's pose, so a step reading context the host refreshes from
+   * this snapshot has to see this snapshot's context and not the previous
+   * one's), so `conn.ownStats.lastError` inside the callback is still the
+   * PREVIOUS snapshot's error. The event is therefore parked here without its
+   * `error` and settled from the first thing that runs afterwards, which is
+   * either the next frame or the next snapshot: the reconcile has certainly
+   * happened by then, and `lastError` is a value the reconcile writes and
+   * nothing else touches.
+   *
+   * `bench/paddle.mjs` reads `detail.error` on every reconcile past the first,
+   * so what this buys is one frame of lag, roughly 16ms, between the event's
+   * own `t` and the number attached to it. The only event that can be drained
+   * unsettled is the very last one before a read, and `Math.abs(undefined)` is
+   * NaN, which fails every comparison the script makes rather than reading as a
+   * zero error it did not measure.
+   *
+   * A SECOND SNAPSHOT LANDING BEFORE ANY FRAME leaves the older event
+   * unsettled, because `lastError` is a single value and by then it describes
+   * the newer reconcile. At 20Hz snapshots against a 60fps loop that is the
+   * hidden-tab case rather than the ordinary one, and attributing the newer
+   * error to the newer event is the only honest reading available.
+   */
+  let pendingReconcile: BenchEvent | null = null;
+  const settleReconcile = (): void => {
+    if (pendingReconcile === null) return;
+    pendingReconcile.detail.error = +(conn.ownStats?.lastError ?? 0).toFixed(3);
+    pendingReconcile = null;
   };
 
   /**
@@ -148,8 +195,6 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
   let winner: string | null = null;
   let serveIn = 0;
   let selfPid = '';
-  /** Which end we defend, from the first snapshot that names us. `null` until then, which is also "there is nothing of ours to draw or to predict against". */
-  let selfSide: 'left' | 'right' | null = null;
   /** Rooms that have refused this client for capacity. ALL of them are sent on the next assign; see the balancer route for why one is not enough. */
   const refusedRooms: string[] = [];
   let reassigns = 0;
@@ -216,7 +261,10 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       //
       // TEXT FRAMES ARE DELIBERATELY NOT RECORDED, and that is not a
       // simplification. The library's own transport frames share this socket:
-      // a `pong` every 2000ms, `relay-expiring`, the roster seed. A pong
+      // a `pong` every 2000ms, `relay-expiring`, the roster seed, and since
+      // 1.0.0 the `input-lead` frame that carries the server's playout depth
+      // about once a second. Every one of them is JSON text, which is what
+      // keeps this ring a series of SNAPSHOT arrivals for free. A pong
       // landing inside a 400ms snapshot hole would split it into two 200ms
       // gaps and report a healthy socket, which is the exact wrong answer for
       // the one question this ring exists to settle. Snapshots are the binary
@@ -240,7 +288,7 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
   /** What actually reaches the connection: the override if one was given, else the library's own default (mirrored above, since the library does not hand it back). Reported on `stats()` as `inputLeadMs` rather than recomputed there, so the two can never disagree. */
   const inputLeadMs = opts.leadMs ?? DEFAULT_INPUT_LEAD_MS;
 
-  const conn = new RoomConnection<PongSnapshot, string>({
+  const conn = new RoomConnection<PongSnapshot, string, PongInput>({
     WebSocketImpl: BenchSocket,
     // Required rather than defaulted, because a client silently running on the
     // wrong basis skews the tick counter, the server-tick estimate and the
@@ -299,22 +347,22 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       return `${proto}//${location.host}/api/ws?${params.toString()}`;
     },
 
-    decodeSnapshot: (buf) => {
-      const snap = JSON.parse(new TextDecoder().decode(buf)) as PongSnapshot;
-      // STEP 3 OF THE FEEDBACK LOOP `onBufferHealth` OPENED: pick OUR OWN pid's
-      // depth out of the per-paddle field and hand it back as `inputLead`. The
-      // connection folds it into its stamping lead, trimming toward a two-tick
-      // cushion, so the lead converges on the smallest one that keeps the
-      // server's buffer fed rather than staying at the open-loop guess.
-      const mine = snap.paddles.find((p) => p.pid === selfPid);
-      return { ...snap, inputLead: mine?.inputLead };
-    },
+    // THE HOST'S DECODER AND NOTHING ELSE. It used to lift this pid's own
+    // playout depth out of the per-paddle field and hand it back as
+    // `inputLead`, which was the third of four host-owned steps in a feedback
+    // loop the library now runs end to end on its own `depth` and `input-lead`
+    // frames. `DecodedSnapshotLike` is `tick` and `serverTime` and nothing
+    // else at 1.0.0.
+    decodeSnapshot: (buf) => JSON.parse(new TextDecoder().decode(buf)) as PongSnapshot,
 
-    // The connection owns the interpolator: it pushes every decoded snapshot in
-    // with the right two timestamps and clears the buffer on every epoch
-    // change. All this side has to say is which parts of a snapshot MOVE.
+    // The connection owns the interpolator: it CONSTRUCTS one (`into` is
+    // optional at 1.0.0, and this page pins no delay bounds, so the hand-held
+    // `new SnapshotInterpolator()` on the line above is gone), pushes every
+    // decoded snapshot in with the right two timestamps, and clears the buffer
+    // on every epoch change. All this side has to say is which parts of a
+    // snapshot MOVE. `conn.interpolator` is the handle either way, so nothing
+    // is lost by letting it build its own.
     interpolate: {
-      into: interp,
       entities: (snap) => {
         const entities = new Map<string, EntitySample>();
         entities.set('ball', { x: snap.ball.x, y: snap.ball.y });
@@ -330,7 +378,52 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       },
     },
 
+    // ---- our own paddle, predicted locally --------------------------------
+    //
+    // THE WHOLE OF THE STAMPED PATH'S CLIENT HALF, OWNED BY THE CONNECTION.
+    // Once per frame it stamps a record for every tick the counter crossed
+    // (never per frame, never per keydown: the tick is the unit the server
+    // applies input on), predicts each through `step`, sends the last six as
+    // one frame, and returns the pose to draw as `frame().own`: the pose
+    // history read at a render playhead that moves at real time one tick behind
+    // the newest stamp, with what is left of the last correction added, so a
+    // counter re-anchor is caught up over a second rather than drawn as a
+    // lurch. Once per snapshot it replays from `ownPose` and re-seats, AFTER
+    // `onSnapshot` has run. This was a `PredictedEntity` held beside the
+    // connection with its three calls ordered by hand until 1.0.0.
+    predict: {
+      // THE SAME FUNCTION THE SIMULATION RUNS, on the same input, on the tick
+      // the record names. The fourth argument is the tick this call produces,
+      // ignored here because a paddle collides with nothing that changes over
+      // time.
+      step: (pose, input, dt) => ({ x: pose.x, y: stepPaddleY(pose.y, input.dir, dt) }),
+      // Bounds the correction glide to the paddle's own top speed and sets the
+      // snap distance at half a second of travel.
+      maxSpeed: PADDLE_SPEED,
+      initial: { x: 0, y: FIELD_H / 2 },
+      // OUR AUTHORITATIVE POSE, out of each snapshot. The connection replays
+      // its stored records from here, adopts the result and glides the
+      // difference away; the first confirmation snaps instead, which is also
+      // what seats the paddle's x on the side the server assigned. `null` until
+      // the roster names us, and nothing is reconciled until then.
+      ownPose: (snap) => {
+        const mine = snap.paddles.find((p) => p.pid === selfPid);
+        return mine === undefined ? null : { x: paddleX(mine.side), y: mine.y };
+      },
+      // JSON ON THE WIRE, and it is load bearing for this rig rather than a
+      // preference. `{ dir }` is not the default binary shape (a two-axis stick
+      // and a button mask), so the binary wire would refuse the first input
+      // with a `TypeError`; more to the point, `'json'` is byte for byte the
+      // 0.3.x frame, which is what keeps `lib/wire.ts`'s decoder, the
+      // `onBadInput` count taken off it, and every stamped-input number in the
+      // Results table measuring the same contract they measured before.
+      wire: 'json',
+    },
+
     onSnapshot: (snap) => {
+      // The PREVIOUS snapshot's reconcile has certainly run by now, so settle
+      // its event before this one's is written. See `pendingReconcile`.
+      settleReconcile();
       epochSnaps += 1;
       lastServerTime = snap.serverTime;
       if (snap.inst !== lastInst) {
@@ -347,30 +440,27 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       for (const p of snap.paddles) next.set(p.pid, p.score);
       scores = next;
 
-      // RECONCILE THE PREDICTION. The snapshot is authoritative for tick
-      // `snap.tick`, but the entity has already stamped and simulated inputs
-      // for ticks after that, so the server's y is where our paddle was
-      // several ticks ago. The entity replays its own stored records from
-      // there, adopts the result, and glides the difference away; the first
-      // confirmation snaps, which is also what seats the paddle's x.
+      // NOTHING RECONCILES HERE ANY MORE, and nothing keeps the side either.
+      // The connection does both, from `predict.ownPose` above, the moment this
+      // callback returns: the first confirmation seats the paddle's x on the
+      // side the server chose and every frame after it draws from
+      // `frame().own`. All that is left on this side is the diagnostic.
       const mine = snap.paddles.find((p) => p.pid === selfPid);
       if (!mine) return;
-      selfSide = mine.side;
-      paddle.reconcile({ x: paddleX(mine.side), y: mine.y }, snap.tick);
-      // DIAGNOSTIC. The tick the snapshot named, the tick the entity had
-      // stamped to, and the error the replay left, as a magnitude: nonzero
-      // anywhere but the first confirmation means the two ends disagreed
-      // about the input timeline, which `bench/paddle.mjs` provokes on
-      // purpose by changing the input mid-run. The old `covered` and
-      // `missing` fields are gone with the hand-written window: the entity
-      // keeps a replay history deeper than its re-send window, so a lead
-      // past six ticks no longer comes up short.
-      record('reconcile', {
-        snapTick: snap.tick,
-        tick: conn.tick.value,
-        error: +paddle.stats.lastError.toFixed(3),
-        serverY: +mine.y.toFixed(3),
-      });
+      // DIAGNOSTIC. The tick the snapshot named, the tick the counter had
+      // stamped to, the server's own y, and the error the replay leaves: an
+      // error nonzero anywhere but the first confirmation means the two ends
+      // disagreed about the input timeline, which `bench/paddle.mjs` provokes
+      // on purpose by changing the input mid-run. The error is the one field
+      // that cannot be filled in here, because the reconcile that produces it
+      // has not run yet; see `pendingReconcile` for how it is attached and what
+      // that costs.
+      pendingReconcile = {
+        t: performance.now(),
+        kind: 'reconcile',
+        detail: { snapTick: snap.tick, tick: conn.tick.value, serverY: +mine.y.toFixed(3) },
+      };
+      eventBuf.push(pendingReconcile);
     },
 
     onText: (msg) => {
@@ -447,28 +537,6 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
     },
   });
 
-  // ---- our own paddle, the stamped path's client half ----------------------
-  //
-  // Once per frame `advance` stamps a record for every tick the counter
-  // crossed, predicts each through `step`, sends the last six as one JSON array
-  // (what the relay's `decodeInput` parses), and returns the pose to draw: the
-  // pose history read at a render playhead that moves at real time (within a
-  // tenth) one tick behind the newest stamp, with what is left of the last
-  // correction added, so a counter re-anchor is caught up over a second
-  // rather than drawn as a lurch. Once per snapshot `reconcile` replays and
-  // re-seats. The x never changes under `step`; the first reconcile seats it
-  // on the side the server chose. The timestep is `conn.tick.tickMs`.
-  const paddle = new PredictedEntity<{ dir: number }>({
-    conn,
-    // THE SAME FUNCTION THE SIMULATION RUNS, on the same input, on the tick the
-    // record names.
-    step: (pose, input, dt) => ({ x: pose.x, y: stepPaddleY(pose.y, input.dir, dt) }),
-    // Bounds the correction glide to the paddle's own top speed and sets the
-    // snap distance at half a second of travel.
-    maxSpeed: PADDLE_SPEED,
-    initial: { x: 0, y: FIELD_H / 2 },
-  });
-
   // ---- input --------------------------------------------------------------
 
   // The keys only ever move `dir`. Nothing is sent from here: a send is one
@@ -505,24 +573,33 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
 
   let raf = 0;
   const frame = (now: number): void => {
-    // THE ONE PER-FRAME CALL. It advances the tick counter inputs are stamped
-    // against, polls the stall detector, and samples the interpolator, all from
-    // one delta the connection measures for itself.
-    const { entities: view, dt, stalled } = conn.frame(now);
+    // BEFORE `frame()`, unlike the two calls this replaced. The input is an
+    // ARGUMENT to the per-frame call now, so the direction has to be current
+    // when it is made; the counter it stamps against is advanced inside that
+    // same call, which is the ordering the old `advance`-after-`frame()` rule
+    // existed to keep by hand.
     if (opts.bot) dir = botDir(now);
-    // AFTER `frame()`, never before: the counter this stamps against is
-    // advanced by that call, so advancing first stamps every record one frame
-    // into the past. `readDir` is the simulation's own clamp, run here so the
-    // record predicted with is byte for byte the record the server applies.
-    // ONE CALL PER FRAME: it stamps, sends, and returns the pose to draw, so
-    // the draw below reuses `drawn` rather than advancing again.
-    const drawn = paddle.advance({ dir: readDir(dir) }, dt);
+    // The reconcile the previous snapshot triggered has run by now, so its
+    // event can be given its error. See `pendingReconcile`.
+    settleReconcile();
+    // THE ONE PER-FRAME CALL. It advances the tick counter inputs are stamped
+    // against, polls the stall detector, samples the interpolator, and THEN
+    // stamps, predicts and sends this frame's ticks with the input, all from
+    // one delta the connection measures for itself. `readDir` is the
+    // simulation's own clamp, run here so the record predicted with is byte for
+    // byte the record the server applies. `own` is the pose to DRAW, and it is
+    // `null` until the first authoritative pose has been reconciled.
+    const { entities: view, own: drawn, stalled } = conn.frame(now, { dir: readDir(dir) });
 
     // RECORDED BEFORE ANY DRAWING, so a slow canvas cannot show up as a late
     // frame in the measurement. Everything below this line is presentation.
     const marker = view.get('marker');
     const own = selfPid ? view.get(selfPid) : undefined;
-    const predicted = paddle.pose;
+    // The RAW prediction, the pose after the last stamped tick, with no
+    // playhead and no glide in it. `frame().own` is the same prediction as it
+    // is drawn, so the difference between the two is exactly what the draw
+    // adds.
+    const predicted = conn.own;
     const entities: [string, number, number][] = [];
     for (const [id, e] of view) entities.push([id, e.x, e.y]);
     frameBuf.push({
@@ -537,9 +614,9 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
       x: marker ? marker.x : null,
       extrap: marker ? marker.extrapolated : null,
       ownX: own ? own.y : null,
-      ownY: selfSide !== null ? drawn.y : null,
-      predictedY: selfSide !== null ? predicted.y : null,
-      errZ: selfSide !== null ? +(drawn.y - predicted.y).toFixed(3) : null,
+      ownY: drawn ? drawn.y : null,
+      predictedY: predicted ? predicted.y : null,
+      errZ: drawn && predicted ? +(drawn.y - predicted.y).toFixed(3) : null,
       entities,
       stalled,
     });
@@ -588,8 +665,9 @@ export function startPong(canvas: HTMLCanvasElement, opts: PongOptions): () => v
 
     // OUR OWN PADDLE COMES FROM THE PREDICTION, drawn between its last two
     // stamped ticks plus whatever is left of the last correction. No
-    // interpolation delay and no round trip in it.
-    if (selfSide !== null) {
+    // interpolation delay and no round trip in it. `null` until the server has
+    // confirmed we have a paddle, so there is nothing of ours to draw yet.
+    if (drawn !== null) {
       ctx.fillStyle = '#fff';
       ctx.fillRect(drawn.x * sx - 2, drawn.y * sy - 12 * sy, 4, 24 * sy);
     }

@@ -9,25 +9,18 @@ import { SESSION_SECRET } from '@/lib/secret';
 export const runtime = 'nodejs';
 
 /*
- * THE TOKEN LIFETIME IS LEFT AT THE LIBRARY'S DEFAULT, AND THAT IS A DECISION
- * RATHER THAN AN OMISSION, because the relay lifetime chain is the thing it has
- * to outlive and this app is the one most likely to be bitten by getting it
- * wrong. The warm swap at a relay's 290 second cap REUSES the session already
- * on hand, so a token that expires part way along the chain has every
- * replacement after it refused (401 before the upgrade, 4001 after it), the
- * swap discarded, and each cap quietly back to costing a cold reconnect.
- * Nothing on the server says so, because from the relay's side a refused socket
- * is an ordinary refused socket; the only symptom is `conn.stats().swapsFailed`
- * climbing in step with `swapsAttempted`, which is exactly why the harness
- * reports both.
+ * NO `maxAgeS` HERE, AND THAT IS STILL A DECISION RATHER THAN AN OMISSION.
+ * `makeToken` stamps `iat` and signs; the age is read on the VERIFYING side by
+ * `verifyToken`, and `makeToken`'s own `maxAgeS` option changes not one byte of
+ * what it returns. So writing the number here would read like a policy and be
+ * one nowhere, which is worse than leaving it out.
  *
- * AND NOTE WHICH SIDE THE NUMBER ACTUALLY LIVES ON: `maxAgeS` is read by
- * `verifyToken`, not by `makeToken`, and `createRelayRoute` verifies with
- * `{ secret }` alone. So a `maxAgeS` passed here would change nothing at all
- * while reading like a policy, which is worse than not writing it: the
- * effective lifetime is `verifyToken`'s own default of 12 hours either way.
- * That covers a run of any length this rig is meant for, roughly 150 relay caps
- * deep, and it is still an expiry rather than a forever-token.
+ * WHAT CHANGED AT 1.0.0 IS THE OTHER END. `createRelayRoute` verified with
+ * `{ secret }` alone through 0.3.x, so the effective lifetime was
+ * `verifyToken`'s own 12 hour default whatever any route said; it takes
+ * `maxAgeS` now and threads it into that call, which is where this deployment
+ * states the number, once, as `SESSION_MAX_AGE_S` in lib/rooms.ts. See that
+ * constant for why the value is still twelve hours and what it has to outlive.
  */
 
 /**

@@ -123,13 +123,16 @@ Environment variables:
   Protection off is the better answer for this project**, because a bench should
   measure the public path.
 
-`tickroom` installs from the registry now: `npm install tickroom@0.3.1`. It is
-pinned exactly (`"tickroom": "0.3.1"`, no `^`) rather than left to float,
-because `1.0.0` is also published and is `latest` on the registry, and it is a
-breaking release this project has not migrated to. A caret here would pick it
-up on the next `npm install` with no diff in this repo to review. To pick up a
-later library version on purpose: bump the pin in `package.json`, run
-`npm install`, and work through `CHANGELOG.md` for what changed.
+`tickroom` installs from the registry: `npm install tickroom@1.0.0`. It is
+pinned exactly (`"tickroom": "1.0.0"`, no `^`) rather than left to float,
+because **1.0.0 is the release this rig now measures**, and every number under
+Results is a number about one stated version of the library. A caret would let
+the next `npm install` change the thing being measured with no diff in this
+repo to review, which for a bench is not a convenience but a silently invalid
+result. To pick up a later library version on purpose: bump the pin in
+`package.json`, run `npm install`, and work through `CHANGELOG.md` for what
+changed. Runs A to G were measured on 0.3.x; see "The 1.0.0 migration" below
+for what moved and what the harness reads instead.
 
 ## Running the harness
 
@@ -254,7 +257,15 @@ It holds a direction key down, releases it, waits, and repeats that several
 times, counting every reconcile past the first (which only snaps onto the
 spawn pose) whose error is above 0.25 units, below which is quantisation
 noise from the snapshot's y rounded to a tenth, plus every direction flip in
-the DRAWN paddle after a release. A healthy deployment prints zero for both. It exists because `run.mjs` and `hidden-tab.mjs` both measure the
+the DRAWN paddle after a release. A healthy deployment prints zero for both.
+**Since 1.0.0 the `error` on a `reconcile` event lands one frame after the rest
+of that event**, because the connection reconciles the prediction after
+`onSnapshot` returns and `onSnapshot` is where the event is written; the page
+parks the record and fills the field from `conn.ownStats.lastError` on the next
+frame or the next snapshot, whichever comes first. Nothing in the grading
+changes: the field is late by roughly 16ms, or absent on the single event that
+can still be pending when the harness drains, and an absent one fails the
+comparison rather than reading as a zero error nobody measured. It exists because `run.mjs` and `hidden-tab.mjs` both measure the
 marker, and the marker is server-driven: constant velocity, untouched by any
 key, so it can never show a disagreement in the input timeline. Steady motion
 hides a one-tick error completely; only a change in the input reveals it, as a
@@ -1066,6 +1077,71 @@ LOOP rather than the target is what governs a one-tick cushion, and sweeping
 the target itself would mean exposing the constant as a host option, which the
 library deliberately does not do.
 
+### The 1.0.0 migration, 2026-09-08
+
+Runs A to G above were measured on tickroom 0.3.x. The pin is `1.0.0` now, and
+this section is what moved so that a number from before the migration can still
+be read against a number from after it.
+
+**Nothing the harness reads changed shape.** `stats()`, `frames()`, `events()`,
+`arrivals()` and `pid()` are the same calls returning the same fields, and
+`bench/analyse.mjs` was not touched. Two things about them are worth knowing:
+
+- **`reconcile.error` is one frame late.** The connection reconciles the
+  prediction AFTER `onSnapshot` returns, deliberately, so that a `step` reading
+  context a host refreshes from the snapshot replays through that snapshot's
+  context rather than the previous one's. `onSnapshot` is the only callback a
+  snapshot reaches, so the event is written there without its error and filled
+  from `conn.ownStats.lastError` on the next frame or the next snapshot. See the
+  `paddle.mjs` note above.
+- **`ownY`, `predictedY` and `errZ` are the same three quantities from a
+  different pair of accessors.** `ownY` is `conn.frame(now, input).own`, the
+  drawn pose, where it was `PredictedEntity.advance`'s return; `predictedY` is
+  `conn.own`, where it was `entity.pose`; `errZ` is still the drawn y minus the
+  raw one. `ownY` is `null` until the first authoritative pose has been
+  reconciled, where it used to be `null` until the roster named this pid: the
+  same instant, one snapshot either side. `predictedY` is no longer gated at
+  all, because `conn.own` starts at `predict.initial` and is a real number from
+  the first frame; `errZ` is still `null` whenever either half is, so the pair
+  the analysis reads moves together.
+
+**The playout depth stopped being this app's to carry.** The 0.3.x loop was four
+host-owned steps: `onBufferHealth` into `PongState.depth`, `encodeSnapshot` onto
+the wire as a per-paddle `inputLead`, `decodeSnapshot` lifting this pid's value
+back out, and the connection folding it into its stamping lead. The ticker
+publishes a `depth` frame per room per second now, each relay forwards its own
+client's value as an `input-lead` control frame, and `RoomConnection` consumes
+it beside `pong`. So `sim/pong.ts` lost `depth` and `onBufferHealth` entirely,
+`PongSnapshot` lost both `inputLead` fields, and `decodeSnapshot` is one line.
+The measurement is unaffected in one way that is worth stating rather than
+assuming: those control frames are JSON text, and `BenchSocket` records only
+BINARY arrivals, so the arrival-gap series is still a series of snapshots and
+nothing else.
+
+**The routes stayed as four factories.** 1.0.0 adds `createRoom`, which states
+every shared fact once, and this app already states them once in `lib/rooms.ts`.
+It could not be adopted for one reason: `createRoom` takes `runtime` as a value
+and validates at module evaluation, and the `inst` marker that makes a ticker
+handoff visible from a browser has to be generated per invocation, which is why
+`app/api/ticker/route.ts` builds both the runtime and the route inside `GET`.
+The device cookie and the mint rate limit in this app's session route are a
+second, independent reason. The factories are the documented low-level form, not
+a deprecated one.
+
+**Two options the migration made real rather than cosmetic.**
+`createRelayRoute` takes `maxAgeS` now and passes it into its own
+`verifyToken`, which through 0.3.x always took the 12 hour default whatever a
+session route said, so `SESSION_MAX_AGE_S` in `lib/rooms.ts` states that number
+once and the relay enforces it. And the library's default `decodeInput` is
+`decodeInputAuto`, which answers malformed input with `[]` instead of throwing;
+`onBadInput` counts throws, so this app keeps its own throwing `decodeJsonInput`
+and the counter keeps meaning what the Results table says it means.
+
+**What is owed.** `bench/paddle.mjs` and a twelve minute `bench/run.mjs` against
+the deployment on 1.0.0, so the Results table has a run measured on the version
+the pin now names. Local gates pass; the socket does not upgrade off Vercel, so
+nothing downstream of `/api/ws` has been exercised on this build.
+
 ## Running locally
 
 ```bash
@@ -1093,6 +1169,7 @@ Gates:
 npx tsc --noEmit
 SESSION_SECRET=dummy npm run build
 node bench/run.mjs --help
+node bench/paddle.mjs --help
 ```
 
 ## File map
@@ -1110,11 +1187,12 @@ game/
   pong.ts                   the RoomConnection wiring and the measurement hook
   bench.ts                  the record shapes window.__bench exposes
 lib/
-  rooms.ts                  namespace, base, capacity, the duration-cap arithmetic
+  rooms.ts                  namespace, base, capacity, the duration-cap arithmetic,
+                            the session token lifetime the relay verifies against
   secret.ts                 fail-closed SESSION_SECRET
   tickerUrl.ts              the Deployment Protection bypass, and why
   upgradeWebSocket.ts       the one platform seam
-  wire.ts                   the JSON input decoder
+  wire.ts                   the JSON input decoder, which throws so onBadInput counts
   mintLimit.ts              in-process per-IP mint limit
 sim/
   pong.ts                   the room, with the constant-velocity marker
@@ -1134,7 +1212,10 @@ bench/
 
 `sim/pong.ts` is `examples/pong/sim.ts` with four changes, all of them because
 this is a measurement rig rather than a game. Each is documented at its site in
-the file.
+the file. It used to carry a fifth thing that was not a change at all, a `depth`
+map fed by `onBufferHealth` and published per paddle as `inputLead`, copied from
+the 0.3.x example; the library carries that on its own control frames at 1.0.0
+and the example dropped it too, so this file dropped it in step.
 
 1. **`SEATS` is 20, not 2.** A populated room is the thing being measured:
    `bytesDelivered` is `bytesPublished * players`, the per-socket subscriber
@@ -1172,7 +1253,15 @@ the file.
 
 `game/pong.ts` is `examples/pong/client.ts` wired exactly as the library
 README's step 3 shows, plus a bot mode, the `window.__bench` hook, a room
-chosen by query parameter, and a `WebSocketImpl` that counts.
+chosen by query parameter, and a `WebSocketImpl` that counts. At 1.0.0 that
+wiring is one object: `predict: { step, maxSpeed, ownPose, wire: 'json' }` on
+the connection, `conn.frame(now, input)` once a frame, and `frame().own` as the
+pose to draw, where it used to be a `PredictedEntity` held beside the connection
+with the order of its three calls kept by hand. `wire: 'json'` rather than the
+new binary default because the bench's input is `{ dir }` and not a
+`DefaultInput`, and because `'json'` is byte for byte the 0.3.x frame, so the
+stamped-input contract every number here reports is the one it has always
+been.
 
 That last one is `BenchSocket`, and it exists because two numbers a bench needs
 are on the wrong side of the library's API and correctly so. **Outgoing round

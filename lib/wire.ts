@@ -14,6 +14,16 @@ import type { ClientInput } from 'tickroom/core';
  * itself before `decodeInput` is ever called, so this decoder sees only what
  * `attachRelay` now promises: a single `Buffer`.
  *
+ * IT IS ALSO WHY THIS FILE STILL EXISTS AT 1.0.0. The relay's default decoder
+ * is `decodeInputAuto` now, which reads both wires (the binary input window and
+ * this JSON frame, sniffed on the first byte) and answers anything malformed
+ * with `[]` rather than throwing. That is the right default and it is the wrong
+ * one HERE: `onBadInput` in `app/api/ws/route.ts` counts throws, and a counter
+ * wired behind a decoder that never throws reads zero forever, which on a bench
+ * is a broken decoder reported as a healthy one. So this app keeps its own
+ * throwing decoder, and the page keeps `predict.wire: 'json'` so that what
+ * arrives is what this parses.
+ *
  * THIS IS A TRUST BOUNDARY. Everything it returns was chosen by a client, so it
  * validates the SHAPE here (an object at all, a finite `seq`, a finite
  * `targetTick`) and leaves the VALUES to the simulation's own clamping, which

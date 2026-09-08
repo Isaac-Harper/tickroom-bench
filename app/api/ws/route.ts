@@ -1,6 +1,6 @@
 import { createRelayRoute } from 'tickroom/adapters/vercel';
 
-import { BASE, MAX_DURATION_S, MAX_PLAYERS, NAMESPACE, isValidBase } from '@/lib/rooms';
+import { BASE, MAX_DURATION_S, MAX_PLAYERS, NAMESPACE, SESSION_MAX_AGE_S, isValidBase } from '@/lib/rooms';
 import { SESSION_SECRET } from '@/lib/secret';
 import { TICKER_URL } from '@/lib/tickerUrl';
 import { upgradeWebSocket } from '@/lib/upgradeWebSocket';
@@ -75,6 +75,18 @@ export const GET = createRelayRoute({
   // because the ticker route lives in this same deployment. See lib/tickerUrl.ts
   // for the one case where it is not the bare path.
   tickerUrl: TICKER_URL,
+  // NOT THE LIBRARY'S DEFAULT any more, and passing it is the whole of what
+  // 1.0.0 changed here: `createRelayRoute` takes `maxAgeS` and threads it into
+  // its own `verifyToken`, which through 0.3.x always took the 12 hour default
+  // whatever the mint said. `SESSION_MAX_AGE_S` is the same number
+  // `app/api/session/route.ts` mints with, so the expiry a session states is
+  // the one the socket path enforces.
+  maxAgeS: SESSION_MAX_AGE_S,
+  // THE APP'S OWN DECODER RATHER THAN THE LIBRARY'S DEFAULT, and at 1.0.0 that
+  // is what keeps `onBadInput` above a real number. The default is
+  // `decodeInputAuto`, which answers malformed input with `[]` instead of
+  // throwing, so a counter wired to it would read zero forever. See
+  // `lib/wire.ts`.
   decodeInput: decodeJsonInput,
   maxDurationS: MAX_DURATION_S,
   // The display name rides the socket URL and becomes join metadata, which is

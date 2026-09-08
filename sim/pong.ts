@@ -8,6 +8,15 @@
 // the simulation, and events handed back to the host. None of that is different
 // here. What follows is only what changed, and why.
 //
+// NOR IS THE PLAYOUT DEPTH HERE ANY MORE, which is the one thing this file lost
+// at tickroom 1.0.0 rather than gained. It used to carry a `depth` map fed by
+// `onBufferHealth` and put each pid's value on the wire as a per-paddle
+// `inputLead`, so the client could pick its own out in `decodeSnapshot` and
+// hand it back to the connection. The library publishes that depth on its own
+// control frames and consumes it on its own side now, so all four host-owned
+// steps are gone from this file and from `game/pong.ts` alike, and the loop
+// that trims the stamping lead runs whether a host remembers it or not.
+//
 // 1. `SEATS` IS 20, NOT 2. The number being measured is a POPULATED room:
 //    `bytesDelivered` is `bytesPublished * players`, the per-socket subscriber
 //    fan-out is what a managed Redis plan bills, and a two-seat table can show
@@ -115,12 +124,6 @@ export interface PongState {
   winner: string | null;
   /** The measurement ruler. See `MARKER_SPEED`. */
   markerX: number;
-  /** Server-side playout depth per pid, in ticks, as `onBufferHealth` reports
-   *  it. NOT part of the room: it describes the ticker that is running right
-   *  now, which is why `serialize` leaves it out and every restore starts it
-   *  empty. It lives in state at all because the buffer is inside the ticker
-   *  and this hook is the only route by which its depth can reach a snapshot. */
-  depth: Map<string, number>;
 }
 
 export type PongEvent =
@@ -214,7 +217,6 @@ export function createPongRuntime(inst: string): RoomRuntime<PongState, PongEven
         seed: 0x9e3779b9,
         winner: null,
         markerX: 0,
-        depth: new Map(),
       };
       serve(state, 1);
       return state;
@@ -230,17 +232,6 @@ export function createPongRuntime(inst: string): RoomRuntime<PongState, PongEven
     // unconditionally is the usually-right answer: an unstamped record
     // (`targetTick: 0`) still applies on arrival either way.
     usesPlayout: () => true,
-
-    // How deep this player's buffer is running, reported every tick including
-    // starved ones. The buffer lives inside the ticker, so this hook is the
-    // ONLY route by which its depth can reach the state and therefore the
-    // snapshot: `encodeSnapshot` puts it on the wire per paddle, the client
-    // picks its own pid's value out in `decodeSnapshot` and hands it back as
-    // `inputLead`, and the connection trims its stamping lead toward the
-    // smallest one that keeps the buffer fed.
-    onBufferHealth(s, pid, health) {
-      s.depth.set(pid, health);
-    },
 
     // IDEMPOTENT, and this is a contract requirement rather than politeness.
     // The relay republishes a join every second as a heartbeat (pub/sub is
@@ -263,7 +254,6 @@ export function createPongRuntime(inst: string): RoomRuntime<PongState, PongEven
 
     leave(s, pid) {
       s.paddles.delete(pid);
-      s.depth.delete(pid);
     },
 
     applyInput(s, pid, input: ClientInput) {
@@ -377,12 +367,6 @@ export function createPongRuntime(inst: string): RoomRuntime<PongState, PongEven
     // way a checkpoint silently loses half a room. Convert explicitly, both
     // ways, and let the round-trip test catch it if you forget.
     //
-    // `depth` IS DELIBERATELY NOT HERE, and that is not the same mistake. It is
-    // the playout depth of the ticker that is exiting, measured against a
-    // client whose stamping lead is about to be re-anchored across the handoff,
-    // so carrying it over would hand the successor a reading about a buffer
-    // that no longer exists. The successor rebuilds it from its own first tick.
-    //
     // `markerX` IS HERE, and it is the one field this app cannot afford to
     // lose: the resume step across a handoff is measured on it, so a marker
     // that restarted at zero would turn the library's central claim into a
@@ -424,7 +408,6 @@ export function createPongRuntime(inst: string): RoomRuntime<PongState, PongEven
         seed: raw.seed >>> 0,
         winner: raw.winner ?? null,
         markerX: typeof raw.markerX === 'number' && Number.isFinite(raw.markerX) ? raw.markerX : 0,
-        depth: new Map(),
       };
     },
 
@@ -450,12 +433,6 @@ export function createPongRuntime(inst: string): RoomRuntime<PongState, PongEven
           side: p.side,
           y: Math.round(p.y * 10) / 10,
           score: p.score,
-          // Step 2 of the feedback loop `onBufferHealth` opened. Per paddle
-          // rather than "just mine", because a snapshot is published ONCE for
-          // the whole room and delivered to every player: there is no
-          // per-client snapshot to put a single value in. Each client picks out
-          // its own.
-          inputLead: s.depth.get(p.pid) ?? 0,
         })),
       });
     },

@@ -34,6 +34,36 @@ export const maxDuration = 800;
 // evaluates route modules during a build.
 if (createPongRuntime('probe').tickHz !== TICK_HZ) throw new Error('pong tickHz mismatch');
 
+/*
+ * FOUR FACTORIES RATHER THAN ONE `createRoom`, AND THE REASON IS THE `inst`
+ * MARKER BELOW.
+ *
+ * tickroom 1.0.0 adds `createRoom`, which composes the ticker, relay, balancer
+ * and session routes out of one bag so that a shared fact (the secret, the
+ * namespace, `maxPlayers`, `maxRooms`, `maxDurationS`, the room validator and
+ * the fallback room) is stated once instead of four times. That is the right
+ * default for a host, and every one of those facts is already stated once here:
+ * they live in `lib/rooms.ts` and the four route files import them.
+ *
+ * What `createRoom` cannot carry is the one thing this deployment is FOR. It
+ * takes `runtime` as a VALUE and validates at module evaluation, so the runtime
+ * and the `buildId` are fixed for the life of the container. `inst` has to be
+ * generated per INVOCATION (see `GET` below for the measurement that proved
+ * module scope lies under Fluid compute), which means a fresh
+ * `createPongRuntime(inst)` and a fresh route closure inside every request.
+ * Composing the other three around a ticker that has to be rebuilt per request
+ * would mean calling `createRoom` per request as well, which rebuilds a relay
+ * and a balancer that have no reason to change, or reaching into its `ticker`
+ * escape hatch for a value it has already baked in.
+ *
+ * The session route is the second reason and is independent of the first: this
+ * app's own carries a device cookie and an in-process mint rate limit
+ * (`lib/mintLimit.ts`), and `createRoom`'s built-in session route has neither.
+ *
+ * So the factories stay, which the 1.0.0 release documents as the supported
+ * low-level form rather than a deprecated one.
+ */
+
 /**
  * The authoritative tick loop. One invocation owns the room's lease, runs the
  * simulation at a fixed rate, publishes a snapshot every tick, checkpoints

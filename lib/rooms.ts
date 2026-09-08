@@ -99,6 +99,36 @@ export const PRESENCE_TIMEOUT_MS = 60_000;
 export const MAX_DURATION_S = 800;
 
 /**
+ * How long a minted session token stays redeemable, in seconds, and the value
+ * `app/api/ws/route.ts` passes as `createRelayRoute`'s `maxAgeS`.
+ *
+ * IT LIVES ON THE VERIFYING SIDE, WHICH IS WHY THIS IS THE ONLY PLACE IT IS
+ * WRITTEN. `makeToken` stamps `iat` and signs; `verifyToken` is what compares
+ * the two, so the relay route is the one place in this app where the number has
+ * any effect at all. Through 0.3.x it could not be written there either:
+ * `createRelayRoute` verified with `{ secret }` alone and always took
+ * `verifyToken`'s own 12 hour default, so an expiry a session route stated was
+ * one nothing enforced. tickroom 1.0.0 gives the route its own `maxAgeS` and
+ * threads it into that call.
+ *
+ * Twelve hours keeps the effective lifetime exactly where every run in the
+ * Results table measured it, which is the point of stating the old default
+ * rather than picking a new number in the same commit that made it reachable.
+ *
+ * SIZE IT AGAINST THE RELAY LIFETIME CHAIN, NOT AGAINST ONE RELAY. The warm
+ * swap at a relay's 790 second cap REUSES the session already on hand, so a
+ * token that expires part way along the chain has every replacement after it
+ * refused (401 before the upgrade, 4001 after it), the swap discarded, and
+ * every cap quietly back to costing a cold reconnect. Nothing on the server
+ * says so: from the relay's side a refused socket is an ordinary refused
+ * socket, and the only symptom is `conn.stats().swapsFailed` climbing in step
+ * with `swapsAttempted`, which is exactly why the harness reports both. Twelve
+ * hours covers a run of any length this rig is meant for, roughly 150 relay
+ * caps deep, and it is still an expiry rather than a forever-token.
+ */
+export const SESSION_MAX_AGE_S = 12 * 60 * 60;
+
+/**
  * `hasOwnProperty`-grade validation with one legal answer. A bare `raw === BASE`
  * is exactly right here and does not have the inherited-property hazard a
  * `raw in ROOMS` lookup would: this value is interpolated into Redis key names,
