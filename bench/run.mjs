@@ -63,14 +63,21 @@ const CLIENT_LIST_MS = 5000;
 const READY_TIMEOUT_MS = 60_000;
 
 /**
- * The Redis key prefix, and it MUST equal `NAMESPACE` in `lib/rooms.ts`. It is
- * retyped here rather than imported because this file is plain `.mjs` run by
- * node and that one is TypeScript compiled by Next, and a build step between
+ * The Redis key prefix, and it MUST equal `NAMESPACE` in the TARGET's own
+ * `lib/rooms.ts`, which since 2026-09-08 is `tickroom-demo`'s and not this
+ * repo's: the page moved into that app under base `bench`, and that app
+ * namespaces every key it writes `tickroom:`. Read against the wrong prefix
+ * this sampler finds no stats key at all and a run reports zero flushes
+ * caught, which reads as a quiet deployment rather than as a misconfigured
+ * harness.
+ *
+ * It is retyped here rather than imported because this file is plain `.mjs` run
+ * by node and that one is TypeScript compiled by Next, and a build step between
  * the harness and the deployment it measures would be a worse trade than one
  * duplicated string. `roomKeys` in `tickroom/core` is the definition both
  * follow: `${namespace}:${roomId}:${suffix}`.
  */
-const NAMESPACE = 'bench';
+const NAMESPACE = 'tickroom';
 
 const USAGE = `
 tickroom-bench: drive N browser clients against a deployment and report what they rendered.
@@ -78,10 +85,10 @@ tickroom-bench: drive N browser clients against a deployment and report what the
   node bench/run.mjs --url <base-url> [options]
 
 Options:
-  --url <url>        Base URL of the deployment. Required. Example: https://tickroom-bench.vercel.app
+  --url <url>        Base URL of the deployment. Required. Example: https://tickroom-demo.vercel.app
   --clients <n>      Number of browser clients. Default 3.
   --minutes <m>      Run length in minutes. Default 12. Fractional values are allowed.
-  --room <id>        Room instance every client joins. Default "pong".
+  --room <id>        Room instance every client joins. Default "bench".
   --headed           Show the browsers. Default headless.
   --redis <url>      Read the room's stats key and CLIENT LIST from this Redis. Optional.
   --lead <ms>        Override the connection's input lead (0 to 1000) on every client
@@ -101,7 +108,7 @@ Notes:
 `.trim();
 
 function parseArgs(argv) {
-  const out = { clients: 3, minutes: 12, room: 'pong', headed: false, out: join(HERE, 'out') };
+  const out = { clients: 3, minutes: 12, room: 'bench', headed: false, out: join(HERE, 'out') };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') return { help: true };
@@ -241,7 +248,12 @@ async function main() {
     page.on('console', (m) => {
       if (m.type() === 'error') rec.consoleErrors.push(m.text().slice(0, 400));
     });
-    const target = new URL(args.url);
+    // THE PAGE IS AT `/bench`, NOT AT THE ROOT. `--url` is the deployment and
+    // the deployment is now `tickroom-demo`, whose root is the demo's landing
+    // page: the instrumented page that publishes `window.__bench` is the
+    // unlinked `/bench` route. `new URL(path, base)` keeps `--url`'s own
+    // origin, so every `/api/*` call this script makes is unchanged.
+    const target = new URL('/bench', args.url);
     target.searchParams.set('bot', '1');
     target.searchParams.set('room', args.room);
     target.searchParams.set('name', rec.name);

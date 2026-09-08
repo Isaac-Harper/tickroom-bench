@@ -32,7 +32,7 @@ tickroom-bench: call the in-function Redis latency probe and report what it meas
   node bench/probe.mjs --url <base-url> --key <SESSION_SECRET> [options]
 
 Options:
-  --url <url>      Base URL of the deployment. Required. Example: https://tickroom-bench.vercel.app
+  --url <url>      Base URL of the deployment. Required. Example: https://tickroom-demo.vercel.app
   --key <secret>   The deployment's SESSION_SECRET. Required: the route answers 401 without it,
                     on purpose, because it burns function time and must not be public.
   --seconds <n>    How long the probe samples for. Default 60. The route itself bounds this

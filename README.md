@@ -95,6 +95,11 @@ against the number the library's README already publishes.
 
 ## Deploying
 
+**This project is no longer deployed.** Its Vercel project was removed on
+2026-09-08 and the page moved into `tickroom-demo` under the route `/bench`; see
+the note at the top of Results. What follows is how it was deployed, kept
+because the app in this repo is still the source the demo's copy was taken from.
+
 Vercel, Node runtime, no `vercel.json`. From this directory:
 
 ```bash
@@ -145,11 +150,11 @@ The frame loop **is** the measurement surface.
 
 ```bash
 # the main run: three clients in one room for twelve minutes
-node bench/run.mjs --url https://tickroom-bench.vercel.app \
+node bench/run.mjs --url https://tickroom-demo.vercel.app \
   --clients 3 --minutes 12 --redis "$REDIS_URL"
 
 # the hidden-tab run: one client backgrounded for 6.5 minutes, then brought back
-node bench/hidden-tab.mjs --url https://tickroom-bench.vercel.app --minutes 6.5 --chrome
+node bench/hidden-tab.mjs --url https://tickroom-demo.vercel.app --minutes 6.5 --chrome
 ```
 
 Both write a timestamped JSON to `bench/out/` and print a markdown summary to
@@ -250,7 +255,7 @@ next two runs on the kept profile timed out waiting for a player id.
 two can see.**
 
 ```bash
-node bench/paddle.mjs --url https://tickroom-bench.vercel.app [--room pong~6] [--moves 8] [--hold 350]
+node bench/paddle.mjs --url https://tickroom-demo.vercel.app [--room bench~6] [--moves 8] [--hold 350]
 ```
 
 It holds a direction key down, releases it, waits, and repeats that several
@@ -294,7 +299,7 @@ when either grade fails.
 hiding it.**
 
 ```bash
-node bench/discard.mjs --url https://tickroom-bench.vercel.app [--room pong~8] [--roster-seconds 90]
+node bench/discard.mjs --url https://tickroom-demo.vercel.app [--room bench~8] [--roster-seconds 90]
 ```
 
 A hidden tab still has a renderer: its socket is up, snapshots keep arriving,
@@ -308,7 +313,7 @@ notices. The script records four milestones from the moment the tab is brought
 back (first rendered frame, a minted id, an open socket, being drawn in the
 roster again), the reconnect count on the new connection, which must be 0
 because a reload is not a reconnect, and how long the discarded client's seat
-took to leave the room. It defaults to room `pong~8` rather than `pong` on
+took to leave the room. It defaults to room `bench~8` rather than `bench` on
 purpose: a discard leaves a dead player behind for as long as the reap takes,
 which would show up in anything else measuring the same room.
 
@@ -345,7 +350,7 @@ the discard cannot be triggered.
 Safari.**
 
 ```bash
-node bench/hidden-safari.mjs --url https://tickroom-bench.vercel.app --minutes 6.5 [--room pong~9]
+node bench/hidden-safari.mjs --url https://tickroom-demo.vercel.app --minutes 6.5 [--room bench~9]
 ```
 
 Every number `hidden-tab.mjs` produces is about Chromium's throttling policy:
@@ -380,6 +385,20 @@ reads at launch: turn it on, then quit and reopen Safari. `sudo safaridriver
 and it asks for an administrator password.
 
 ## Results
+
+**2026-09-08: the `tickroom-bench` Vercel project was removed, and the page it
+served now lives in the demo app.** Every run below was measured against
+`https://tickroom-bench.vercel.app`, which no longer resolves. The instrumented
+page, the `window.__bench` surface, the twenty-seat simulation with its
+constant-velocity `marker` and its per-invocation `inst`, and `/api/probe` were
+carried into `tickroom-demo` as the route `/bench` on a third room base, also
+called `bench`, so nothing about that app's own `pong` and `cursors` rooms
+changed. Two things about the target moved with it and every command in this
+file is already updated for both: **the page is at `/bench` rather than at the
+root**, and **the Redis key prefix is `tickroom:` rather than `bench:`**, so the
+main run's stats key is now `tickroom:bench:stats`. Everything below this note
+is left exactly as it was measured: the numbers are about the deployment named
+in each run, not about the one the harness points at today.
 
 Measured on **2026-09-03 (UTC)** against `https://tickroom-bench.vercel.app`:
 Vercel project `tickroom-bench` in a personal team on the **Pro** plan, Next.js
@@ -668,7 +687,7 @@ must equal the deployment's `SESSION_SECRET`; anything else, or nothing, is a
 401 before a single Redis connection opens.
 
 ```bash
-node bench/probe.mjs --url https://tickroom-bench.vercel.app --key "$SESSION_SECRET" --seconds 60
+node bench/probe.mjs --url https://tickroom-demo.vercel.app --key "$SESSION_SECRET" --seconds 60
 ```
 
 It prints count, p50, p90, p99 and max for both series, the region the function

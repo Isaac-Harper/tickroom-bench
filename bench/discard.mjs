@@ -90,7 +90,7 @@ memory pressure, then bring the tab back and measure the return.
 
 Options:
   --url <url>        Base URL of the deployment. Required.
-  --room <id>        Room instance to join. Default "pong~8", NOT the main room:
+  --room <id>        Room instance to join. Default "bench~8", NOT the main room:
                      a discard leaves a dead player in the roster until the
                      server reaps it, which would show up in anything else
                      measuring the same room at the same time.
@@ -108,7 +108,7 @@ Exits 3 when the discard could not be triggered at all, naming what was tried.
 `.trim();
 
 function parseArgs(argv) {
-  const out = { room: 'pong~8', rosterSeconds: 90, port: CDP_PORT, app: null, out: join(HERE, 'out') };
+  const out = { room: 'bench~8', rosterSeconds: 90, port: CDP_PORT, app: null, out: join(HERE, 'out') };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') return { help: true };
@@ -349,7 +349,12 @@ async function main() {
   };
 
   try {
-    const target = new URL(args.url);
+    // THE PAGE IS AT `/bench`, NOT AT THE ROOT. `--url` is the deployment and
+    // the deployment is now `tickroom-demo`, whose root is the demo's landing
+    // page: the instrumented page that publishes `window.__bench` is the
+    // unlinked `/bench` route. `new URL(path, base)` keeps `--url`'s own
+    // origin, so every `/api/*` call this script makes is unchanged.
+    const target = new URL('/bench', args.url);
     target.searchParams.set('bot', '1');
     target.searchParams.set('room', args.room);
     target.searchParams.set('name', 'discard');

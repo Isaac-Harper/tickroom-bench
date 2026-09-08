@@ -80,7 +80,7 @@ Options:
   --url <url>        Base URL of the deployment. Required.
   --minutes <m>      How long the tab stays hidden. Default 6.5, which crosses both
                      a ticker handoff (270s) and a relay warm swap (290s).
-  --room <id>        Room instance to join. Default "pong~9", not the main room,
+  --room <id>        Room instance to join. Default "bench~9", not the main room,
                      because this is usually run beside the Chrome hidden-tab run.
   --port <n>         Port for safaridriver. Default ${DRIVER_PORT}. A driver already
                      listening there is reused and left running.
@@ -93,7 +93,7 @@ Exits 3 when the tab never reads hidden, because then the run measured nothing.
 `.trim();
 
 function parseArgs(argv) {
-  const out = { minutes: 6.5, room: 'pong~9', port: DRIVER_PORT, out: join(HERE, 'out') };
+  const out = { minutes: 6.5, room: 'bench~9', port: DRIVER_PORT, out: join(HERE, 'out') };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') return { help: true };
@@ -295,7 +295,12 @@ async function main() {
     driver.sessionId = created.sessionId;
     console.error(`[safari] session ${driver.sessionId}`);
 
-    const target = new URL(args.url);
+    // THE PAGE IS AT `/bench`, NOT AT THE ROOT. `--url` is the deployment and
+    // the deployment is now `tickroom-demo`, whose root is the demo's landing
+    // page: the instrumented page that publishes `window.__bench` is the
+    // unlinked `/bench` route. `new URL(path, base)` keeps `--url`'s own
+    // origin, so every `/api/*` call this script makes is unchanged.
+    const target = new URL('/bench', args.url);
     target.searchParams.set('bot', '1');
     target.searchParams.set('room', args.room);
     target.searchParams.set('name', 'safari');

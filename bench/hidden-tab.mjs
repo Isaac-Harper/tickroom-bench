@@ -103,7 +103,7 @@ Options:
   --url <url>        Base URL of the deployment. Required.
   --minutes <m>      How long the tab stays hidden. Default 6.5, which crosses both
                      a ticker handoff (270s) and a relay warm swap (290s).
-  --room <id>        Room instance to join. Default "pong".
+  --room <id>        Room instance to join. Default "bench".
   --chrome           Drive a REAL browser process over CDP instead of letting
                      Playwright launch one. THIS IS THE MODE THAT ACTUALLY HIDES
                      THE TAB: a Playwright-launched page is sent
@@ -125,7 +125,7 @@ defaults, and still cannot make document.hidden true; it says so, loudly.
 `.trim();
 
 function parseArgs(argv) {
-  const out = { minutes: 6.5, room: 'pong', chrome: false, port: CDP_PORT, out: join(HERE, 'out') };
+  const out = { minutes: 6.5, room: 'bench', chrome: false, port: CDP_PORT, out: join(HERE, 'out') };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') return { help: true };
@@ -280,7 +280,12 @@ async function main() {
     const pageA = context.pages()[0] ?? (await context.newPage());
     pageA.on('pageerror', (e) => pageErrors.push(String(e && e.message ? e.message : e)));
 
-    const target = new URL(args.url);
+    // THE PAGE IS AT `/bench`, NOT AT THE ROOT. `--url` is the deployment and
+    // the deployment is now `tickroom-demo`, whose root is the demo's landing
+    // page: the instrumented page that publishes `window.__bench` is the
+    // unlinked `/bench` route. `new URL(path, base)` keeps `--url`'s own
+    // origin, so every `/api/*` call this script makes is unchanged.
+    const target = new URL('/bench', args.url);
     target.searchParams.set('bot', '1');
     target.searchParams.set('room', args.room);
     target.searchParams.set('name', 'hidden');

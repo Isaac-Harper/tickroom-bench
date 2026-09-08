@@ -12,7 +12,7 @@
 // error was not zero plus every direction flip in the DRAWN paddle after a
 // release. A healthy deployment prints zero for both.
 //
-//   node bench/paddle.mjs --url https://tickroom-bench.vercel.app [--room pong~6] [--moves 8] [--hold 350]
+//   node bench/paddle.mjs --url https://tickroom-demo.vercel.app [--room bench~6] [--moves 8] [--hold 350]
 //
 // Exits 1 when any nonzero reconcile error or any post-release flip was seen.
 import { chromium } from 'playwright';
@@ -24,10 +24,12 @@ if (!args.url || args.help) {
   console.log('usage: node bench/paddle.mjs --url <base-url> [--room <id>] [--moves N] [--hold MS]');
   process.exit(args.help ? 0 : 2);
 }
-const room = args.room ?? 'pong~6';
+const room = args.room ?? 'bench~6';
 const moves = Number(args.moves ?? 8);
 const hold = Number(args.hold ?? 350);
-const url = `${args.url.replace(/\/$/, '')}/?room=${encodeURIComponent(room)}`;
+// The instrumented page is `/bench` on the demo deployment, not its root; see
+// the same note in `run.mjs`. The origin is `--url`'s own either way.
+const url = new URL(`/bench?room=${encodeURIComponent(room)}`, args.url).toString();
 
 const browser = await chromium.launch();
 const page = await browser.newPage();
