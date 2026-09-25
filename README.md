@@ -103,10 +103,10 @@ because the app in this repo is still the source the demo's copy was taken from.
 Vercel, Node runtime, no `vercel.json`. From this directory:
 
 ```bash
-vercel --scope isaacs-projects-b02601f4        # first run: link, project name tickroom-bench
+vercel --scope <your-team>        # first run: link, project name tickroom-bench
 vercel env add REDIS_URL production            # a real TCP rediss:// URL
 vercel env add SESSION_SECRET production       # any high-entropy string
-vercel --prod --scope isaacs-projects-b02601f4
+vercel --prod --scope <your-team>
 ```
 
 Environment variables:
